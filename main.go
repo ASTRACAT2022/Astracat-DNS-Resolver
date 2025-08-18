@@ -3,9 +3,11 @@ package main
 import (
 	"io/ioutil" // Add ioutil for discarding logs
 	"log"
+	"math" // Add math for exponential backoff
 	"net"
 	"os"   // Add os for environment variable access
 	"sync" // Add sync for mutex
+	"time" // Add time for retry logic
 
 	"github.com/miekg/dns"
 )
@@ -19,19 +21,32 @@ var (
 
 // rootServers defines the list of root DNS servers
 var rootServers = []string{
-	"198.41.0.4:53",     // A.ROOT-SERVERS.NET
-	"199.9.14.201:53",   // B.ROOT-SERVERS.NET
-	"192.33.4.12:53",    // C.ROOT-SERVERS.NET
-	"199.7.91.13:53",    // D.ROOT-SERVERS.NET
-	"192.203.230.10:53", // E.ROOT-SERVERS.NET
-	"192.5.5.241:53",    // F.ROOT-SERVERS.NET
-	"192.112.36.4:53",   // G.ROOT-SERVERS.NET
-	"198.97.190.53:53",  // H.ROOT-SERVERS.NET
-	"192.36.148.17:53",  // I.ROOT-SERVERS.NET
-	"192.58.128.30:53",  // J.ROOT-SERVERS.NET
-	"193.0.14.129:53",   // K.ROOT-SERVERS.NET
-	"199.7.83.42:53",    // L.ROOT-SERVERS.NET
-	"202.12.27.33:53",   // M.ROOT-SERVERS.NET
+	"198.41.0.4:53",    // A.ROOT-SERVERS.NET (IPv4)
+	"2001:503:ba3e::2:30:53", // A.ROOT-SERVERS.NET (IPv6)
+	"199.9.14.201:53",  // B.ROOT-SERVERS.NET (IPv4)
+	"2001:500:200::b:53", // B.ROOT-SERVERS.NET (IPv6)
+	"192.33.4.12:53",   // C.ROOT-SERVERS.NET (IPv4)
+	"2001:500:2::c:53", // C.ROOT-SERVERS.NET (IPv6)
+	"199.7.91.13:53",   // D.ROOT-SERVERS.NET (IPv4)
+	"2001:500:2d::d:53", // D.ROOT-SERVERS.NET (IPv6)
+	"192.203.230.10:53", // E.ROOT-SERVERS.NET (IPv4)
+	"2001:500:a8::e:53", // E.ROOT-SERVERS.NET (IPv6)
+	"192.5.5.241:53",   // F.ROOT-SERVERS.NET (IPv4)
+	"2001:500:2f::f:53", // F.ROOT-SERVERS.NET (IPv6)
+	"192.112.36.4:53",  // G.ROOT-SERVERS.NET (IPv4)
+	"2001:500:12::d0d:53", // G.ROOT-SERVERS.NET (IPv6)
+	"198.97.190.53:53", // H.ROOT-SERVERS.NET (IPv4)
+	"2001:500:1::53:53", // H.ROOT-SERVERS.NET (IPv6)
+	"192.36.148.17:53", // I.ROOT-SERVERS.NET (IPv4)
+	"2001:500:3::42:53", // I.ROOT-SERVERS.NET (IPv6)
+	"192.58.128.30:53", // J.ROOT-SERVERS.NET (IPv4)
+	"2001:503:c27::2:30:53", // J.ROOT-SERVERS.NET (IPv6)
+	"193.0.14.129:53",  // K.ROOT-SERVERS.NET (IPv4)
+	"2001:7fd::1:53", // K.ROOT-SERVERS.NET (IPv6)
+	"199.7.83.42:53",   // L.ROOT-SERVERS.NET (IPv4)
+	"2001:500:3::42:53", // L.ROOT-SERVERS.NET (IPv6)
+	"202.12.27.33:53",  // M.ROOT-SERVERS.NET (IPv4)
+	"2001:dc3::35:53", // M.ROOT-SERVERS.NET (IPv6)
 }
 
 // resolveDNS recursively resolves a DNS query
@@ -47,28 +62,43 @@ func resolveDNS(q dns.Question) (*dns.Msg, error) {
 	}
 	cacheMutex.RUnlock()
 
-	// Start with root servers
 	currentServers := rootServers
 	var response *dns.Msg
 	originalQuestion := q // Store the original question for caching
+
+	const maxRetries = 3
+	const initialTimeout = 1 * time.Second
 
 	for len(currentServers) > 0 {
 		var nextServers []string
 		resolvedCurrentQuery := false
 
 		for _, nsAddr := range currentServers {
-			c := new(dns.Client)
-			m := new(dns.Msg)
-			m.SetQuestion(q.Name, q.Qtype)
-			m.RecursionDesired = false // Important: iterative queries to authoritative servers
-			// Enable EDNS0 for larger UDP responses
-			m.SetEdns0(4096, false)
+			var resp *dns.Msg
+			var err error
+			tried := 0
+			for tried < maxRetries {
+				c := new(dns.Client)
+				// Set a timeout for the exchange
+				c.Timeout = initialTimeout * time.Duration(math.Pow(2, float64(tried)))
+				m := new(dns.Msg)
+				m.SetQuestion(q.Name, q.Qtype)
+				m.RecursionDesired = false // Important: iterative queries to authoritative servers
+				// Enable EDNS0 for larger UDP responses
+				m.SetEdns0(4096, false)
 
-			log.Printf("Querying %s for %s", nsAddr, q.Name)
-			resp, _, err := c.Exchange(m, nsAddr)
-			if err != nil {
-				log.Printf("Error querying %s: %v", nsAddr, err)
-				continue
+				log.Printf("Querying %s for %s (attempt %d/%d, timeout %v)", nsAddr, q.Name, tried+1, maxRetries, c.Timeout)
+				resp, _, err = c.Exchange(m, nsAddr)
+				if err == nil && resp != nil && resp.Rcode != dns.RcodeServerFailure {
+					break // Success, break retry loop
+				}
+				log.Printf("Error querying %s: %v. Retrying...", nsAddr, err)
+				tried++
+			}
+
+			if err != nil || resp == nil || resp.Rcode == dns.RcodeServerFailure {
+				log.Printf("Failed to query %s after %d attempts: %v", nsAddr, maxRetries, err)
+				continue // Try next current server
 			}
 
 			// If we get an answer for the original query type, we are done with this iteration
@@ -81,7 +111,7 @@ func resolveDNS(q dns.Question) (*dns.Msg, error) {
 						break
 					}
 				}
-
+				
 				if gotFinalAnswer {
 					response = resp
 					// Handle CNAMEs if present in answers
@@ -125,12 +155,12 @@ func resolveDNS(q dns.Question) (*dns.Msg, error) {
 						// If A record not in additional section, try resolving NS IP using a public resolver
 						log.Printf("Resolving NS IP for %s using public resolver", ns.Ns)
 						publicClient := new(dns.Client)
+						// Enable EDNS0 for public resolver queries
+						publicClient.SetEdns0(4096, false)
 						publicMsg := new(dns.Msg)
 						publicMsg.SetQuestion(ns.Ns, dns.TypeA)
 						publicMsg.RecursionDesired = true // We want recursion for this external query
-						// Enable EDNS0 for public resolver queries
-						publicMsg.SetEdns0(4096, false)
-
+						
 						publicResp, _, publicErr := publicClient.Exchange(publicMsg, "8.8.8.8:53") // Use Google Public DNS
 						if publicErr == nil && publicResp != nil && len(publicResp.Answer) > 0 {
 							for _, ans := range publicResp.Answer {
@@ -143,7 +173,7 @@ func resolveDNS(q dns.Question) (*dns.Msg, error) {
 							log.Printf("Failed to resolve NS IP %s using public resolver: %v", ns.Ns, publicErr)
 						}
 					}
-
+					
 					if nsIP != "" {
 						nextServers = append(nextServers, net.JoinHostPort(nsIP, "53"))
 						foundNextNS = true
@@ -152,7 +182,7 @@ func resolveDNS(q dns.Question) (*dns.Msg, error) {
 					}
 				}
 			}
-
+			
 			// If we found next NS servers, break to start a new iteration with them
 			if foundNextNS {
 				currentServers = nextServers
@@ -162,7 +192,7 @@ func resolveDNS(q dns.Question) (*dns.Msg, error) {
 
 			// If no resolution or delegation found in this entire iteration, break outer loop
 		}
-
+		
 		// If no resolution or delegation found in this entire iteration, break outer loop
 		if !resolvedCurrentQuery {
 			break
