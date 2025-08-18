@@ -156,10 +156,10 @@ func resolveDNS(q dns.Question) (*dns.Msg, error) {
 						log.Printf("Resolving NS IP for %s using public resolver", ns.Ns)
 						publicClient := new(dns.Client)
 						// Enable EDNS0 for public resolver queries
-						publicClient.SetEdns0(4096, false)
 						publicMsg := new(dns.Msg)
 						publicMsg.SetQuestion(ns.Ns, dns.TypeA)
 						publicMsg.RecursionDesired = true // We want recursion for this external query
+						publicMsg.SetEdns0(4096, false)
 						
 						publicResp, _, publicErr := publicClient.Exchange(publicMsg, "8.8.8.8:53") // Use Google Public DNS
 						if publicErr == nil && publicResp != nil && len(publicResp.Answer) > 0 {
