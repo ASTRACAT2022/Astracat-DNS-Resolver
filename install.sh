@@ -20,16 +20,62 @@ log_error() {
 
 # --- Check and Install Go ---
 install_go() {
+    MIN_GO_VERSION="1.21"
+    GO_INSTALL_PATH="/usr/local"
+    GO_VERSION_TO_INSTALL="1.22.5" # You can update this to the latest stable version if needed
+    GO_TAR_FILENAME="go${GO_VERSION_TO_INSTALL}.linux-amd64.tar.gz"
+    GO_DOWNLOAD_URL="https://golang.org/dl/${GO_TAR_FILENAME}"
+
+    CURRENT_GO_VERSION=""
     if command -v go &>/dev/null; then
-        log_info "Go is already installed: $(go version)"
-    else
-        log_info "Go not found. Installing Go..."
-        sudo apt update
-        sudo apt install -y golang
-        if ! command -v go &>/dev/null; then
-            log_error "Go installation failed. Please install Go manually or check your system's package manager."
+        CURRENT_GO_VERSION=$(go version | awk '{print $3}' | sed 's/go//')
+        log_info "Go is already installed: go version ${CURRENT_GO_VERSION}"
+    fi
+
+    # Function to compare versions (e.g., "1.19" < "1.21")
+    version_gt() { test "$(printf '%s\n' "$@" | sort -V | head -n 1)" != "$1"; }
+
+    if [ -z "$CURRENT_GO_VERSION" ] || version_gt "$MIN_GO_VERSION" "$CURRENT_GO_VERSION"; then
+        if [ -z "$CURRENT_GO_VERSION" ]; then
+            log_info "Go not found or too old. Installing Go ${GO_VERSION_TO_INSTALL}..."
+        else
+            log_info "Installed Go version ${CURRENT_GO_VERSION} is older than required ${MIN_GO_VERSION}. Upgrading to Go ${GO_VERSION_TO_INSTALL}..."
         fi
-        log_info "Go installed successfully: $(go version)"
+
+        # Remove any existing Go installation from /usr/local/go
+        if [ -d "${GO_INSTALL_PATH}/go" ]; then
+            log_info "Removing existing Go installation from ${GO_INSTALL_PATH}/go..."
+            sudo rm -rf "${GO_INSTALL_PATH}/go"
+        fi
+
+        log_info "Downloading Go from ${GO_DOWNLOAD_URL}"
+        wget -q --show-progress "${GO_DOWNLOAD_URL}"
+        if [ $? -ne 0 ]; then
+            log_error "Failed to download Go from ${GO_DOWNLOAD_URL}"
+        fi
+
+        log_info "Extracting Go to ${GO_INSTALL_PATH}"
+        sudo tar -C "${GO_INSTALL_PATH}" -xzf "${GO_TAR_FILENAME}"
+        if [ $? -ne 0 ]; then
+            log_error "Failed to extract Go to ${GO_INSTALL_PATH}"
+        fi
+
+        log_info "Cleaning up downloaded tarball"
+        rm "${GO_TAR_FILENAME}"
+
+        # Add Go to PATH if not already there (for the current session and .bashrc for future sessions)
+        if ! grep -q "${GO_INSTALL_PATH}/go/bin" ~/.bashrc; then
+            log_info "Adding Go to PATH in ~/.bashrc"
+            echo "export PATH=$PATH:${GO_INSTALL_PATH}/go/bin" >> ~/.bashrc
+        fi
+        export PATH=$PATH:${GO_INSTALL_PATH}/go/bin
+
+        if ! command -v go &>/dev/null; then
+            log_error "Go installation failed after script execution. Please check your PATH or install Go manually."
+        fi
+        log_info "Go ${GO_VERSION_TO_INSTALL} installed successfully: $(go version)"
+    else
+        log_info "Go version ${CURRENT_GO_VERSION} is already sufficient (>= ${MIN_GO_VERSION})."
     fi
 }
 
