@@ -99,12 +99,12 @@ main() {
     
     log_info "Changing to installation directory and fetching Go modules..."
     pushd "$INSTALL_DIR"
-    go mod tidy
+    /usr/local/go/bin/go mod tidy
     popd
 
     log_info "Building DNS server..."
     pushd "$INSTALL_DIR"
-    go build -o dns-server
+    /usr/local/go/bin/go build -o dns-server
     popd
 
     log_info "DNS server built successfully."
