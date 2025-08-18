@@ -1,9 +1,10 @@
 package main
 
 import (
+	"io/ioutil" // Add ioutil for discarding logs
 	"log"
 	"net"
-	"os" // Add os for environment variable access
+	"os"   // Add os for environment variable access
 	"sync" // Add sync for mutex
 
 	"github.com/miekg/dns"
@@ -18,19 +19,19 @@ var (
 
 // rootServers defines the list of root DNS servers
 var rootServers = []string{
-	"198.41.0.4:53",    // A.ROOT-SERVERS.NET
-	"199.9.14.201:53",  // B.ROOT-SERVERS.NET
-	"192.33.4.12:53",   // C.ROOT-SERVERS.NET
-	"199.7.91.13:53",   // D.ROOT-SERVERS.NET
+	"198.41.0.4:53",     // A.ROOT-SERVERS.NET
+	"199.9.14.201:53",   // B.ROOT-SERVERS.NET
+	"192.33.4.12:53",    // C.ROOT-SERVERS.NET
+	"199.7.91.13:53",    // D.ROOT-SERVERS.NET
 	"192.203.230.10:53", // E.ROOT-SERVERS.NET
-	"192.5.5.241:53",   // F.ROOT-SERVERS.NET
-	"192.112.36.4:53",  // G.ROOT-SERVERS.NET
-	"198.97.190.53:53", // H.ROOT-SERVERS.NET
-	"192.36.148.17:53", // I.ROOT-SERVERS.NET
-	"192.58.128.30:53", // J.ROOT-SERVERS.NET
-	"193.0.14.129:53",  // K.ROOT-SERVERS.NET
-	"199.7.83.42:53",   // L.ROOT-SERVERS.NET
-	"202.12.27.33:53",  // M.ROOT-SERVERS.NET
+	"192.5.5.241:53",    // F.ROOT-SERVERS.NET
+	"192.112.36.4:53",   // G.ROOT-SERVERS.NET
+	"198.97.190.53:53",  // H.ROOT-SERVERS.NET
+	"192.36.148.17:53",  // I.ROOT-SERVERS.NET
+	"192.58.128.30:53",  // J.ROOT-SERVERS.NET
+	"193.0.14.129:53",   // K.ROOT-SERVERS.NET
+	"199.7.83.42:53",    // L.ROOT-SERVERS.NET
+	"202.12.27.33:53",   // M.ROOT-SERVERS.NET
 }
 
 // resolveDNS recursively resolves a DNS query
@@ -80,7 +81,7 @@ func resolveDNS(q dns.Question) (*dns.Msg, error) {
 						break
 					}
 				}
-				
+
 				if gotFinalAnswer {
 					response = resp
 					// Handle CNAMEs if present in answers
@@ -129,7 +130,7 @@ func resolveDNS(q dns.Question) (*dns.Msg, error) {
 						publicMsg.RecursionDesired = true // We want recursion for this external query
 						// Enable EDNS0 for public resolver queries
 						publicMsg.SetEdns0(4096, false)
-						
+
 						publicResp, _, publicErr := publicClient.Exchange(publicMsg, "8.8.8.8:53") // Use Google Public DNS
 						if publicErr == nil && publicResp != nil && len(publicResp.Answer) > 0 {
 							for _, ans := range publicResp.Answer {
@@ -142,7 +143,7 @@ func resolveDNS(q dns.Question) (*dns.Msg, error) {
 							log.Printf("Failed to resolve NS IP %s using public resolver: %v", ns.Ns, publicErr)
 						}
 					}
-					
+
 					if nsIP != "" {
 						nextServers = append(nextServers, net.JoinHostPort(nsIP, "53"))
 						foundNextNS = true
@@ -151,7 +152,7 @@ func resolveDNS(q dns.Question) (*dns.Msg, error) {
 					}
 				}
 			}
-			
+
 			// If we found next NS servers, break to start a new iteration with them
 			if foundNextNS {
 				currentServers = nextServers
@@ -161,7 +162,7 @@ func resolveDNS(q dns.Question) (*dns.Msg, error) {
 
 			// If no resolution or delegation found in this entire iteration, break outer loop
 		}
-		
+
 		// If no resolution or delegation found in this entire iteration, break outer loop
 		if !resolvedCurrentQuery {
 			break
@@ -208,6 +209,9 @@ func handleDnsRequest(w dns.ResponseWriter, r *dns.Msg) {
 }
 
 func main() {
+	// Disable logging to stdout/stderr. Only essential status messages will be printed by the systemd service.
+	log.SetOutput(ioutil.Discard)
+
 	// attach request handler
 	dns.HandleFunc(".", handleDnsRequest)
 
