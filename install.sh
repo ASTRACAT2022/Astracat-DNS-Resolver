@@ -5,7 +5,7 @@ set -e
 # --- Configuration Variables ---
 INSTALL_DIR="/opt/dns-g"
 SERVICE_NAME="dns-g-server"
-DEFAULT_PORT="53"
+DEFAULT_PORT="5353"
 
 # --- Functions ---
 
