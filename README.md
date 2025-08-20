@@ -136,3 +136,33 @@ To run the automated tests (requires Go installed locally):
 ```bash
 /usr/local/go/bin/go test -v
 ```
+
+## Updating the Server
+
+To update the DNS server to the latest version from the GitHub repository, rebuild it, and restart the application, use the provided update scripts.
+
+### Prerequisites for Updates
+
+*   Ensure you are in the `dns-g` project directory.
+*   The `update_code.sh` and `update_and_rebuild.sh` scripts must be present in the project root.
+
+### Update Steps
+
+1.  **Make the update scripts executable (if you haven't already):**
+
+    ```bash
+    chmod +x update_code.sh update_and_rebuild.sh
+    ```
+
+2.  **Run the update and rebuild script:**
+
+    This script will:
+    *   Pull the latest code from the `main` branch of the GitHub repository.
+    *   Rebuild the Go application (`dns-g`).
+    *   Start the `dns-g` application in the background.
+
+    ```bash
+    ./update_and_rebuild.sh
+    ```
+
+    After execution, you will see messages indicating the progress of the update, rebuild, and application start. A final message will confirm that the application is running the latest release.
