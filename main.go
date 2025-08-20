@@ -7,32 +7,23 @@ import (
 	rand "math/rand/v2"
 	"net"
 	"os"
-	"strings"
 	"sync"
 	"time"
 
-	lru "github.com/hashicorp/golang-lru/v2" // Import for LRU cache
 	"github.com/miekg/dns"
 )
 
 const maxCacheSize = 10000
-const maxRetries = 5
+const maxRetries = 3
 const initialTimeout = 2 * time.Second
 
-const (
-	rateLimitWindow     = 1 * time.Second // Time window for rate limiting
-	maxQueriesPerWindow = 100             // Max queries allowed per client IP within the window
-)
-
 var (
-	Cache *lru.Cache[string, CacheEntry] // LRU cache with string key (normalized name)
+	Cache      = make(map[dns.Question]CacheEntry)
+	CacheMutex sync.RWMutex
+	CacheOrder []dns.Question
 
-	CacheMutex sync.RWMutex // Still needed for overall cache access
-
-	// Rate limiting
-	clientQueryCounts     = make(map[string]int)
-	clientQueryTimestamps = make(map[string]time.Time)
-	rateLimitMutex        sync.Mutex
+	NsecCache      = make(map[string]NsecCacheEntry) // Key: NSEC owner name
+	NsecCacheMutex sync.RWMutex
 )
 
 type CacheEntry struct {
@@ -40,67 +31,94 @@ type CacheEntry struct {
 	Expiration time.Time
 }
 
-// NegativeCacheEntry stores negative responses (NXDOMAIN/NODATA)
-type NegativeCacheEntry struct {
-	Msg        *dns.Msg
+type NsecCacheEntry struct {
+	NSEC       *dns.NSEC
 	Expiration time.Time
 }
 
-var NegativeCache *lru.Cache[string, NegativeCacheEntry] // LRU cache for negative responses
-
 var RootServers = []string{
-	"198.41.0.4:53",          // A.ROOT-SERVERS.NET (IPv4)
-	"2001:503:ba3e::2:30:53", // A.ROOT-SERVERS.NET (IPv6)
-	"170.247.170.2:53",       // B.ROOT-SERVERS.NET (IPv4)
-	"2801:1b8:10::b:53",      // B.ROOT-SERVERS.NET (IPv6)
-	"192.33.4.12:53",         // C.ROOT-SERVERS.NET (IPv4)
-	"2001:500:2::c:53",       // C.ROOT-SERVERS.NET (IPv6)
-	"199.7.91.13:53",         // D.ROOT-SERVERS.NET (IPv4)
-	"2001:500:2d::d:53",      // D.ROOT-SERVERS.NET (IPv6)
-	"192.203.230.10:53",      // E.ROOT-SERVERS.NET (IPv4)
-	"2001:500:a8::e:53",      // E.ROOT-SERVERS.NET (IPv6)
-	"192.5.5.241:53",         // F.ROOT-SERVERS.NET (IPv4)
-	"2001:500:2f::f:53",      // F.ROOT-SERVERS.NET (IPv6)
-	"192.112.36.4:53",        // G.ROOT-SERVERS.NET (IPv4)
-	"2001:500:12::d0d:53",    // G.ROOT-SERVERS.NET (IPv6)
-	"198.97.190.53:53",       // H.ROOT-SERVERS.NET (IPv4)
-	"2001:500:1::53:53",      // H.ROOT-SERVERS.NET (IPv6)
-	"192.36.148.17:53",       // I.ROOT-SERVERS.NET (IPv4)
-	"2001:7fe::53:53",        // I.ROOT-SERVERS.NET (IPv6)
-	"192.58.128.30:53",       // J.ROOT-SERVERS.NET (IPv4)
-	"2001:503:c27::2:30:53",  // J.ROOT-SERVERS.NET (IPv6)
-	"193.0.14.129:53",        // K.ROOT-SERVERS.NET (IPv4)
-	"2001:7fd::1:53",         // K.ROOT-SERVERS.NET (IPv6)
-	"199.7.83.42:53",         // L.ROOT-SERVERS.NET (IPv4)
-	"2001:500:9f::42:53",     // L.ROOT-SERVERS.NET (IPv6)
-	"202.12.27.33:53",        // M.ROOT-SERVERS.NET (IPv4)
-	"2001:dc3::35:53",        // M.ROOT-SERVERS.NET (IPv6)
+	"198.41.0.4:53",            // A
+	"170.247.170.2:53",         // B (обнови!)
+	"192.33.4.12:53",           // C
+	"199.7.91.13:53",           // D
+	"192.203.230.10:53",        // E
+	"192.5.5.241:53",           // F
+	"192.112.36.4:53",          // G
+	"198.97.190.53:53",         // H
+	"192.36.148.17:53",         // I
+	"192.58.128.30:53",         // J
+	"193.0.14.129:53",          // K
+	"199.7.83.42:53",           // L
+	"202.12.27.33:53",          // M
+	"[2001:503:ba3e::2:30]:53", // A IPv6
+	"[2801:1b8:10::b]:53",      // B IPv6 (обнови!)
+	"[2001:500:2::c]:53",       // C
+	"[2001:500:2d::d]:53",      // D
+	"[2001:500:a8::e]:53",      // E
+	"[2001:500:2f::f]:53",      // F
+	"[2001:500:12::d0d]:53",    // G
+	"[2001:500:1::53]:53",      // H
+	"[2001:7fe::53]:53",        // I
+	"[2001:503:c27::2:30]:53",  // J
+	"[2001:7fd::1]:53",         // K
+	"[2001:500:9f::42]:53",     // L (исправь 3 на 9f!)
+	"[2001:dc3::35]:53",        // M
 }
 
-const globalResolutionTimeout = 10 * time.Second // Overall timeout for a single DNS resolution
+func ResolveDNS(q dns.Question, doBit bool) (*dns.Msg, error) {
+	log.Printf("Resolving %s", q.Name)
 
-func ResolveDNS(ctx context.Context, q dns.Question, doBit bool) (*dns.Msg, error) {
-	log.Printf("Resolving %s (context timeout: %v)", q.Name, globalResolutionTimeout)
-
-	normalizedQName := dns.Fqdn(strings.ToLower(q.Name))
-
-	// Check positive cache
 	CacheMutex.RLock()
-	if entry, ok := Cache.Get(normalizedQName); ok && time.Now().Before(entry.Expiration) {
+	if entry, ok := Cache[q]; ok && time.Now().Before(entry.Expiration) {
 		CacheMutex.RUnlock()
-		log.Printf("Positive cache hit for %s", q.Name)
+		log.Printf("Cache hit for %s", q.Name)
 		return entry.Msg, nil
 	}
 	CacheMutex.RUnlock()
 
-	// Check negative cache
-	CacheMutex.RLock()
-	if negEntry, ok := NegativeCache.Get(normalizedQName); ok && time.Now().Before(negEntry.Expiration) {
-		CacheMutex.RUnlock()
-		log.Printf("Negative cache hit for %s: returning cached NXDOMAIN/NODATA", q.Name)
-		return negEntry.Msg, nil
+	// Check NSEC cache for negative responses
+	NsecCacheMutex.RLock()
+	for _, entry := range NsecCache {
+		if time.Now().Before(entry.Expiration) && nsecCovers(entry.NSEC, q) {
+			// This NSEC record covers the query name.
+
+			// Case 1: The NSEC owner name is the same as the query name.
+			// This means the name exists. Check for type.
+			if entry.NSEC.Header().Name == q.Name {
+				qtypePresentInNSEC := false
+				for _, t := range entry.NSEC.TypeBitMap {
+					if t == q.Qtype {
+						qtypePresentInNSEC = true
+						break
+					}
+				}
+				if !qtypePresentInNSEC { // Type doesn't exist -> NODATA
+					m := new(dns.Msg)
+					m.SetQuestion(q.Name, q.Qtype)
+					m.SetRcode(m, dns.RcodeSuccess)
+					m.Ns = append(m.Ns, entry.NSEC)
+					NsecCacheMutex.RUnlock()
+					log.Printf("NSEC cache hit for %s: returning NODATA", q.Name)
+					return m, nil
+				}
+				// Type exists, so we must fall through to get the record.
+				log.Printf("NSEC cache hit for %s: type exists, falling through", q.Name)
+				break
+			} else {
+				// Case 2: The NSEC owner name is different from the query name.
+				// This means the query name is in the gap between owner and nextdomain,
+				// which proves the query name does not exist -> NXDOMAIN.
+				m := new(dns.Msg)
+				m.SetQuestion(q.Name, q.Qtype)
+				m.SetRcode(m, dns.RcodeNameError)
+				m.Ns = append(m.Ns, entry.NSEC)
+				NsecCacheMutex.RUnlock()
+				log.Printf("NSEC cache hit for %s: returning NXDOMAIN", q.Name)
+				return m, nil
+			}
+		}
 	}
-	CacheMutex.RUnlock()
+	NsecCacheMutex.RUnlock()
 
 	log.Printf("Cache miss for %s. Starting recursive resolution.", q.Name)
 
@@ -110,13 +128,7 @@ func ResolveDNS(ctx context.Context, q dns.Question, doBit bool) (*dns.Msg, erro
 	)
 
 	for i := 0; i < maxRetries; i++ {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err() // Propagate context cancellation
-		default:
-		}
-
-		resp, err = ResolveRecursive(ctx, q, doBit)
+		resp, err = ResolveRecursive(q, doBit)
 		if err == nil {
 			return resp, nil
 		}
@@ -127,151 +139,114 @@ func ResolveDNS(ctx context.Context, q dns.Question, doBit bool) (*dns.Msg, erro
 	return nil, fmt.Errorf("failed to resolve %s after %d retries: %v", q.Name, maxRetries, err)
 }
 
-func ResolveRecursive(ctx context.Context, q dns.Question, doBit bool) (*dns.Msg, error) {
+func ResolveRecursive(q dns.Question, doBit bool) (*dns.Msg, error) {
 	servers := RootServers
 	originalQuestion := q
-	// Check context cancellation at the beginning of the loop
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	default:
-	}
 	finalMsg := new(dns.Msg)
 	finalMsg.SetQuestion(originalQuestion.Name, originalQuestion.Qtype)
 
-	// currentZone tracks the zone for which we currently have authoritative servers.
-	// It starts at the root.
-	currentZone := "."
-
 	for i := 0; i < 20; i++ { // Limit iterations to prevent infinite loops
-		// Always query for the original question name.
-		// The delegation logic will ensure we query the correct authoritative servers.
-		queryName := originalQuestion.Name
-
-		log.Printf("Querying servers for %s (currentZone: %s): %v", queryName, currentZone, servers)
-
-		// Create a new question with the full name
-		resp, server, err := queryServers(ctx, dns.Question{Name: queryName, Qtype: q.Qtype, Qclass: q.Qclass}, servers, doBit)
+		log.Printf("Querying servers for %s: %v", q.Name, servers)
+		resp, server, err := queryServers(q, servers, doBit)
 		if err != nil {
-			log.Printf("Error querying %s from %s: %v", queryName, server, err)
+			log.Printf("Error querying %s from %s: %v", q.Name, server, err)
 			return nil, err
 		}
 
 		if resp.Rcode != dns.RcodeSuccess {
-			log.Printf("Query for %s failed with rcode %s from %s. Response: %s", queryName, dns.RcodeToString[resp.Rcode], server, resp.String())
-			// If the response is a server failure from an upstream, propagate it.
-			if resp.Rcode == dns.RcodeServerFailure {
-				return resp, fmt.Errorf("upstream server %s returned SERVFAIL for %s", server, queryName)
-			}
-			if len(finalMsg.Answer) > 0 { // If we collected CNAMEs, return them with the error code
+			log.Printf("Query for %s failed with rcode %s from %s. Response: %s", q.Name, dns.RcodeToString[resp.Rcode], server, resp.String())
+			// If we failed after following a CNAME, return the CNAME answer(s) we've collected
+			if len(finalMsg.Answer) > 0 {
 				finalMsg.Rcode = resp.Rcode
 				finalMsg.Ns = resp.Ns
 				return finalMsg, nil
 			}
-			return resp, nil // Return the error response directly
+			return resp, nil
 		}
 
-		// Check if we got the answer for the original question
 		if len(resp.Answer) > 0 {
-			foundAnswerForOriginal := false
 			foundCNAME := false
 			for _, rr := range resp.Answer {
-				if rr.Header().Name == originalQuestion.Name && rr.Header().Rrtype == originalQuestion.Qtype {
-					finalMsg.Answer = append(finalMsg.Answer, rr)
-					foundAnswerForOriginal = true
-				} else if cname, ok := rr.(*dns.CNAME); ok && cname.Header().Name == originalQuestion.Name {
-					finalMsg.Answer = append(finalMsg.Answer, rr)
+				finalMsg.Answer = append(finalMsg.Answer, rr)
+				if cname, ok := rr.(*dns.CNAME); ok {
+					// If we're specifically asking for a CNAME, don't follow it.
 					if originalQuestion.Qtype != dns.TypeCNAME {
-						log.Printf("Following CNAME from %s to %s", originalQuestion.Name, cname.Target)
-						originalQuestion.Name = cname.Target // Update original question to follow CNAME
-						currentZone = "."                    // Reset current zone to roots for new target
-						servers = RootServers                // Restart with new name from roots
+						log.Printf("Following CNAME from %s to %s", q.Name, cname.Target)
+						q.Name = cname.Target
+						servers = RootServers // Restart with new name from roots
 						foundCNAME = true
-						break // Break from this answer loop to restart resolution for CNAME target
 					}
-				} else {
-					finalMsg.Answer = append(finalMsg.Answer, rr) // Add other relevant answers
 				}
 			}
 
 			if foundCNAME {
 				continue // Continue loop to resolve the CNAME target
 			}
-			if foundAnswerForOriginal {
-				log.Printf("Found answer for %s. Response: %s", originalQuestion.Name, finalMsg.String())
-				finalMsg.Rcode = dns.RcodeSuccess
-				CacheResponse(originalQuestion, finalMsg)
-				return finalMsg, nil
-			}
-		}
 
-		// Extract delegation and continue recursion
-		nextServers, hasGlue := extractDelegation(resp)
-		if len(nextServers) > 0 { // If delegation exists, follow it
-			// Update currentZone to the delegated zone
-			delegatedZone := ""
-			for _, rr := range resp.Ns {
-				if ns, ok := rr.(*dns.NS); ok {
-					delegatedZone = ns.Header().Name
-					break
-				}
-			}
-
-			if delegatedZone != "" {
-				currentZone = delegatedZone
-			} else {
-				log.Printf("Warning: No delegated zone found in NS records for %s. Keeping current zone.", queryName)
-			}
-
-			if !hasGlue {
-				log.Printf("Resolving NS IPs for delegation of %s", currentZone)
-				resolvedIPs, err := resolveNS(ctx, nextServers, doBit)
-				if err != nil {
-					log.Printf("Error resolving NS IPs for %s: %v", currentZone, err)
-					return nil, err
-				}
-				servers = resolvedIPs
-			} else {
-				servers = nextServers
-			}
-			continue // Continue loop with new servers
-		}
-
-		// Handle negative caching (NXDOMAIN/NODATA) only if no answer and no delegation was found
-		if resp.Rcode == dns.RcodeNameError || (resp.Rcode == dns.RcodeSuccess && len(resp.Answer) == 0 && len(resp.Ns) > 0) {
-			var soaMinTTL uint32 = 0
-			for _, rr := range resp.Ns {
-				if soa, ok := rr.(*dns.SOA); ok {
-					soaMinTTL = soa.Minttl
-					break
-				}
-			}
-			if soaMinTTL > 0 {
-				CacheNegativeResponse(originalQuestion, resp, soaMinTTL)
-				log.Printf("Cached negative response for %s with SOA MINIMUM TTL %d", originalQuestion.Name, soaMinTTL)
-			} else {
-				CacheNegativeResponse(originalQuestion, resp, 600) // Default to 10 minutes
-				log.Printf("Cached negative response for %s with default TTL (no SOA MINIMUM)", originalQuestion.Name)
-			}
-			return resp, nil // Return the negative response
-		}
-
-		// If no answer, no CNAME, no delegation, and not a negative response, then we've hit a dead end.
-		log.Printf("No answer, CNAME, delegation, or negative response found for %s. Response: %s", queryName, resp.String())
-		if len(finalMsg.Answer) > 0 { // If we collected CNAMEs, return them
-			finalMsg.Rcode = resp.Rcode
-			finalMsg.Ns = resp.Ns
+			log.Printf("Found answer for %s. Response: %s", q.Name, resp.String())
+			finalMsg.Rcode = dns.RcodeSuccess
+			CacheResponse(originalQuestion, finalMsg)
 			return finalMsg, nil
 		}
-		return resp, nil // No progress, return current response
+
+		// Aggressive NSEC caching for NXDOMAIN/NODATA responses
+		if resp.Rcode == dns.RcodeNameError || (resp.Rcode == dns.RcodeSuccess && len(resp.Answer) == 0) {
+			for _, rr := range resp.Ns {
+				if nsec, ok := rr.(*dns.NSEC); ok {
+					CacheNSEC(nsec)
+				}
+			}
+		}
+
+		nextServers, hasGlue := extractDelegation(resp)
+		if len(nextServers) == 0 {
+			log.Printf("No delegation found for %s. Response: %s", q.Name, resp.String())
+			// If we have a CNAME, return that. Otherwise, return the empty response.
+			if len(finalMsg.Answer) > 0 {
+				finalMsg.Rcode = resp.Rcode
+				finalMsg.Ns = resp.Ns
+				return finalMsg, nil
+			}
+			return resp, nil // No answer, no delegation
+		}
+
+		if !hasGlue {
+			log.Printf("Resolving NS IPs for delegation of %s", q.Name)
+			resolvedIPs, err := resolveNS(nextServers, doBit)
+			if err != nil {
+				log.Printf("Error resolving NS IPs for %s: %v", q.Name, err)
+				return nil, err
+			}
+			servers = resolvedIPs
+		} else {
+			servers = nextServers
+		}
 	}
-	return nil, fmt.Errorf("resolution depth limit exceeded for %s", originalQuestion.Name)
+	return nil, fmt.Errorf("resolution depth limit exceeded for %s", q.Name)
 }
 
-func queryServers(ctx context.Context, q dns.Question, servers []string, doBit bool) (*dns.Msg, string, error) {
-	// Use the provided context for the overall query operation.
-	// The individual client timeout is still applied for each exchange.
-	clientTimeout := 5 * time.Second
+// nsecCovers checks if an NSEC record covers the given question's name and type.
+// This is a simplified check and might need more robust implementation for full DNSSEC validation.
+func nsecCovers(nsec *dns.NSEC, q dns.Question) bool {
+	// Check if the NSEC record's owner name is less than or equal to the queried name
+	// and the next domain name is greater than the queried name.
+	// This implies the queried name is within the NSEC record's range.
+	if dns.CompareDomainName(q.Name, nsec.Header().Name) >= 0 && dns.CompareDomainName(q.Name, nsec.NextDomain) < 0 {
+		return true
+	}
+	// Handle the case where the queried name is lexicographically after the last NSEC record
+	// in the zone (i.e., it wraps around to the first NSEC record).
+	if dns.CompareDomainName(nsec.Header().Name, nsec.NextDomain) > 0 { // NSEC record wraps around
+		if dns.CompareDomainName(q.Name, nsec.Header().Name) >= 0 || dns.CompareDomainName(q.Name, nsec.NextDomain) < 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func queryServers(q dns.Question, servers []string, doBit bool) (*dns.Msg, string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second) // Increased timeout
+	defer cancel()
 
 	respChan := make(chan struct {
 		Msg    *dns.Msg
@@ -297,11 +272,10 @@ func queryServers(ctx context.Context, q dns.Question, servers []string, doBit b
 		go func(s string) {
 			defer wg.Done()
 			c := new(dns.Client)
-			c.Timeout = clientTimeout // Set timeout for the client
 			m := new(dns.Msg)
 			m.SetQuestion(q.Name, q.Qtype)
 			m.RecursionDesired = false
-			m.SetEdns0(1232, doBit) // EDNS payload limited to 1232 bytes
+			m.SetEdns0(4096, doBit) // Propagate DO bit
 
 			resp, _, err := c.ExchangeContext(ctx, m, s)
 
@@ -320,8 +294,6 @@ func queryServers(ctx context.Context, q dns.Question, servers []string, doBit b
 					}
 				}
 
-				// Only consider successful responses or specific error codes that indicate a definitive answer (e.g., NXDOMAIN)
-				// Do not send SERVFAIL from upstream to the channel, as we want to retry other servers.
 				if resp.Rcode != dns.RcodeServerFailure {
 					select {
 					case respChan <- struct {
@@ -330,8 +302,6 @@ func queryServers(ctx context.Context, q dns.Question, servers []string, doBit b
 					}{resp, s}:
 					default: // Avoid blocking if another goroutine already sent a response
 					}
-				} else {
-					log.Printf("Upstream server %s returned SERVFAIL for %s. Will try other servers.", s, q.Name)
 				}
 			} else if err != nil {
 				log.Printf("Error exchanging DNS query for %s with %s: %v", q.Name, s, err)
@@ -350,9 +320,10 @@ func queryServers(ctx context.Context, q dns.Question, servers []string, doBit b
 			// This happens if all goroutines failed without sending a response.
 			return nil, "", fmt.Errorf("all queries failed for %s", q.Name)
 		}
+		cancel() // Cancel other ongoing requests
 		return res.Msg, res.Server, nil
 	case <-ctx.Done():
-		return nil, "", fmt.Errorf("querying servers for %s timed out: %w", q.Name, ctx.Err())
+		return nil, "", fmt.Errorf("querying servers for %s timed out", q.Name)
 	}
 }
 
@@ -395,42 +366,149 @@ func extractDelegation(resp *dns.Msg) (servers []string, hasGlue bool) {
 	return
 }
 
-func resolveNS(ctx context.Context, nsNames []string, doBit bool) ([]string, error) {
+func resolveNS(nsNames []string, doBit bool) ([]string, error) {
 	var ips []string
 	for _, name := range nsNames {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err() // Propagate context cancellation
-		default:
-		}
+		// For each NS name, we need to find its IP address iteratively
+		// Start with root servers to resolve the NS name
+		currentServersForNS := RootServers
+		// Try to resolve A records first
+		nsQuestionA := dns.Question{Name: dns.Fqdn(name), Qtype: dns.TypeA, Qclass: dns.ClassINET}
+		// Then try to resolve AAAA records
+		nsQuestionAAAA := dns.Question{Name: dns.Fqdn(name), Qtype: dns.TypeAAAA, Qclass: dns.ClassINET}
 
-		// Recursively resolve A records for the NS name
-		aResp, err := ResolveDNS(ctx, dns.Question{Name: dns.Fqdn(name), Qtype: dns.TypeA, Qclass: dns.ClassINET}, doBit)
-		if err == nil && aResp != nil && aResp.Rcode == dns.RcodeSuccess {
-			for _, rr := range aResp.Answer {
-				if a, ok := rr.(*dns.A); ok {
-					ips = append(ips, net.JoinHostPort(a.A.String(), "53"))
-				}
+		// Attempt to resolve A records
+		for j := 0; j < 10; j++ { // Limit iterations for resolving a single NS name
+			resp, _, err := queryServers(nsQuestionA, currentServersForNS, doBit)
+			if err != nil {
+				log.Printf("Error querying servers for NS A record %s: %v", name, err)
+				break
 			}
-		} else {
-			log.Printf("Could not resolve A record for NS %s: %v", name, err)
-		}
 
-		// Recursively resolve AAAA records for the NS name if no A records were found or for more options
-		if len(ips) == 0 { // Only try AAAA if A records weren't found
-			aaaaResp, err := ResolveDNS(ctx, dns.Question{Name: dns.Fqdn(name), Qtype: dns.TypeAAAA, Qclass: dns.ClassINET}, doBit)
-			if err == nil && aaaaResp != nil && aaaaResp.Rcode == dns.RcodeSuccess {
-				for _, rr := range aaaaResp.Answer {
-					if aaaa, ok := rr.(*dns.AAAA); ok {
-						ips = append(ips, net.JoinHostPort(aaaa.AAAA.String(), "53"))
+			if resp.Rcode == dns.RcodeSuccess && len(resp.Answer) > 0 {
+				for _, ans := range resp.Answer {
+					if a, ok := ans.(*dns.A); ok {
+						ips = append(ips, net.JoinHostPort(a.A.String(), "53"))
 					}
 				}
+				if len(ips) > 0 {
+					break // Found IPs for this NS name, move to next NS name in outer loop
+				}
+			}
+
+			// If no answer, but there are NS records in authority section, follow them
+			delegatedNS, hasGlue := extractDelegation(resp)
+			if len(delegatedNS) == 0 {
+				break // No further delegation for this NS name
+			}
+
+			if !hasGlue {
+				var resolvedDelegatedIPs []string
+				for _, nsName := range delegatedNS {
+					tempServers := RootServers
+					tempQ := dns.Question{Name: dns.Fqdn(nsName), Qtype: dns.TypeA, Qclass: dns.ClassINET} // Still querying for A records here
+					for k := 0; k < 5; k++ {
+						tempResp, _, tempErr := queryServers(tempQ, tempServers, doBit)
+						if tempErr != nil {
+							log.Printf("Error resolving sub-NS %s: %v", nsName, tempErr)
+							break
+						}
+						if tempResp.Rcode == dns.RcodeSuccess && len(tempResp.Answer) > 0 {
+							for _, ans := range tempResp.Answer {
+								if a, ok := ans.(*dns.A); ok {
+									resolvedDelegatedIPs = append(resolvedDelegatedIPs, net.JoinHostPort(a.A.String(), "53"))
+								}
+							}
+							break
+						}
+						tempNextServers, tempHasGlue := extractDelegation(tempResp)
+						if len(tempNextServers) == 0 {
+							break
+						}
+						if !tempHasGlue {
+							tempServers = tempNextServers
+						} else {
+							tempServers = tempNextServers
+						}
+					}
+				}
+				if len(resolvedDelegatedIPs) > 0 {
+					currentServersForNS = resolvedDelegatedIPs
+				} else {
+					break
+				}
 			} else {
-				log.Printf("Could not resolve AAAA record for NS %s: %v", name, err)
+				currentServersForNS = delegatedNS
+			}
+		}
+
+		// Attempt to resolve AAAA records if no A records were found or if we need more options
+		if len(ips) == 0 {
+			currentServersForNS = RootServers // Reset servers for AAAA lookup
+			for j := 0; j < 10; j++ {
+				resp, _, err := queryServers(nsQuestionAAAA, currentServersForNS, doBit)
+				if err != nil {
+					log.Printf("Error querying servers for NS AAAA record %s: %v", name, err)
+					break
+				}
+
+				if resp.Rcode == dns.RcodeSuccess && len(resp.Answer) > 0 {
+					for _, ans := range resp.Answer {
+						if aaaa, ok := ans.(*dns.AAAA); ok {
+							ips = append(ips, net.JoinHostPort(aaaa.AAAA.String(), "53"))
+						}
+					}
+					if len(ips) > 0 {
+						break
+					}
+				}
+
+				delegatedNS, hasGlue := extractDelegation(resp)
+				if len(delegatedNS) == 0 {
+					break
+				}
+
+				if !hasGlue {
+					var resolvedDelegatedIPs []string
+					for _, nsName := range delegatedNS {
+						tempServers := RootServers
+						tempQ := dns.Question{Name: dns.Fqdn(nsName), Qtype: dns.TypeAAAA, Qclass: dns.ClassINET} // Query for AAAA records here
+						for k := 0; k < 5; k++ {
+							tempResp, _, tempErr := queryServers(tempQ, tempServers, doBit)
+							if tempErr != nil {
+								log.Printf("Error resolving sub-NS %s: %v", nsName, tempErr)
+								break
+							}
+							if tempResp.Rcode == dns.RcodeSuccess && len(tempResp.Answer) > 0 {
+								for _, ans := range tempResp.Answer {
+									if aaaa, ok := ans.(*dns.AAAA); ok {
+										resolvedDelegatedIPs = append(resolvedDelegatedIPs, net.JoinHostPort(aaaa.AAAA.String(), "53"))
+									}
+								}
+								break
+							}
+							tempNextServers, tempHasGlue := extractDelegation(tempResp)
+							if len(tempNextServers) == 0 {
+								break
+							}
+							if !tempHasGlue {
+								tempServers = tempNextServers
+							} else {
+								tempServers = tempNextServers
+							}
+						}
+					}
+					if len(resolvedDelegatedIPs) > 0 {
+						currentServersForNS = resolvedDelegatedIPs
+					} else {
+						break
+					}
+				} else {
+					currentServersForNS = delegatedNS
+				}
 			}
 		}
 	}
-
 	if len(ips) == 0 {
 		return nil, fmt.Errorf("could not resolve any NS IPs for %v", nsNames)
 	}
@@ -451,25 +529,35 @@ func CacheResponse(q dns.Question, resp *dns.Msg) {
 	CacheMutex.Lock()
 	defer CacheMutex.Unlock()
 
-	normalizedQName := dns.Fqdn(strings.ToLower(q.Name))
-	Cache.Add(normalizedQName, CacheEntry{
+	if len(Cache) >= maxCacheSize {
+		oldestQ := CacheOrder[0]
+		delete(Cache, oldestQ)
+		CacheOrder = CacheOrder[1:]
+	}
+
+	Cache[q] = CacheEntry{
 		Msg:        resp,
 		Expiration: time.Now().Add(time.Duration(minTTL) * time.Second),
-	})
+	}
+	CacheOrder = append(CacheOrder, q)
 	log.Printf("Cached %s for %d seconds", q.Name, minTTL)
 }
 
-// CacheNegativeResponse caches NXDOMAIN/NODATA responses based on SOA MINIMUM TTL
-func CacheNegativeResponse(q dns.Question, resp *dns.Msg, ttl uint32) {
-	CacheMutex.Lock() // Use CacheMutex for NegativeCache as well
-	defer CacheMutex.Unlock()
+func CacheNSEC(nsec *dns.NSEC) {
+	NsecCacheMutex.Lock()
+	defer NsecCacheMutex.Unlock()
 
-	normalizedQName := dns.Fqdn(strings.ToLower(q.Name))
-	NegativeCache.Add(normalizedQName, NegativeCacheEntry{
-		Msg:        resp,
-		Expiration: time.Now().Add(time.Duration(ttl) * time.Second),
-	})
-	log.Printf("Cached negative response for %s for %d seconds", q.Name, ttl)
+	// Use the NSEC record's TTL for caching
+	minTTL := nsec.Header().Ttl
+	if minTTL == 0 {
+		minTTL = 3600 // Default TTL if not specified
+	}
+
+	NsecCache[nsec.Header().Name] = NsecCacheEntry{
+		NSEC:       nsec,
+		Expiration: time.Now().Add(time.Duration(minTTL) * time.Second),
+	}
+	log.Printf("Cached NSEC for %s for %d seconds", nsec.Header().Name, minTTL)
 }
 
 func HandleDnsRequest(w dns.ResponseWriter, r *dns.Msg) {
@@ -511,50 +599,12 @@ func HandleDnsRequest(w dns.ResponseWriter, r *dns.Msg) {
 	}
 
 	if r.Opcode == dns.OpcodeQuery {
-		clientIP, _, err := net.SplitHostPort(w.RemoteAddr().String())
-		if err != nil {
-			log.Printf("Error getting client IP for rate limiting: %v", err)
-			m.SetRcode(r, dns.RcodeServerFailure)
-			w.WriteMsg(m)
-			return
-		}
-
-		rateLimitMutex.Lock()
-		// Clean up old entries
-		for ip := range clientQueryTimestamps {
-			if time.Since(clientQueryTimestamps[ip]) > rateLimitWindow {
-				delete(clientQueryCounts, ip)
-				delete(clientQueryTimestamps, ip)
-			}
-		}
-
-		// Check rate limit
-		if clientQueryCounts[clientIP] >= maxQueriesPerWindow {
-			rateLimitMutex.Unlock()
-			log.Printf("Rate limit exceeded for client IP %s", clientIP)
-			m.SetRcode(r, dns.RcodeServerFailure) // Or dns.RcodeRefused
-			w.WriteMsg(m)
-			return
-		}
-
-		// Increment query count and update timestamp
-		clientQueryCounts[clientIP]++
-		clientQueryTimestamps[clientIP] = time.Now()
-		rateLimitMutex.Unlock()
-
 		for _, q := range m.Question {
-			log.Printf("Received query for %s from %s", q.Name, clientIP)
-
-			// Create a context with a timeout for the entire resolution process
-			resolveCtx, cancel := context.WithTimeout(context.Background(), globalResolutionTimeout)
-			defer cancel() // Ensure the context is cancelled when ResolveDNS returns
-
-			resp, err := ResolveDNS(resolveCtx, q, doBit)
+			log.Printf("Received query for %s", q.Name)
+			resp, err := ResolveDNS(q, doBit)
 			if err != nil {
-				log.Printf("Error resolving %s: %v. Setting RcodeServerFailure.", q.Name, err)
+				log.Printf("Error resolving %s: %v", q.Name, err)
 				m.SetRcode(r, dns.RcodeServerFailure)
-				// Optionally, you could try to be more specific here if the error type allows.
-				// For now, sticking to SERVFAIL as it's a general server-side issue.
 			} else if resp != nil {
 				// Copy the response fields to the message 'm'
 				m.Answer = resp.Answer
@@ -569,23 +619,11 @@ func HandleDnsRequest(w dns.ResponseWriter, r *dns.Msg) {
 
 func main() {
 	log.SetOutput(os.Stderr)
-
-	// Initialize LRU caches
-	var err error
-	Cache, err = lru.New[string, CacheEntry](maxCacheSize)
-	if err != nil {
-		log.Fatalf("Failed to create positive cache: %v", err)
-	}
-	NegativeCache, err = lru.New[string, NegativeCacheEntry](maxCacheSize)
-	if err != nil {
-		log.Fatalf("Failed to create negative cache: %v", err)
-	}
-
 	dns.HandleFunc(".", HandleDnsRequest)
 
 	port := os.Getenv("DNS_PORT")
 	if port == "" {
-		port = "8054" // Changed default port to 8054 to avoid conflicts
+		port = "53"
 	}
 
 	go func() {
