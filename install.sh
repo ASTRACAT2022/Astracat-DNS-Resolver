@@ -5,7 +5,7 @@ set -e
 # --- Configuration Variables ---
 INSTALL_DIR="/opt/dns-g"
 SERVICE_NAME="dns-g-server"
-DEFAULT_PORT="5353"
+DEFAULT_PORT="53"
 
 # --- Functions ---
 
@@ -92,7 +92,7 @@ main() {
 
     log_info "Creating installation directory $INSTALL_DIR"
     sudo mkdir -p "$INSTALL_DIR"
-    sudo chown "$USER":"$(id -gn "$USER")" "$INSTALL_DIR"
+    sudo chown "$USER":"$USER" "$INSTALL_DIR"
 
     log_info "Copying source files to $INSTALL_DIR"
     cp main.go go.mod go.sum "$INSTALL_DIR/"
@@ -122,10 +122,7 @@ main() {
     log_info "Setting up systemd service..."
     SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
     
-    log_info "Ensuring systemd service directory exists..."
-    sudo mkdir -p "$(dirname "$SERVICE_FILE")"
-    
-    sudo tee "$SERVICE_FILE" > /dev/null <<EOF
+    sudo bash -c "cat > \"$SERVICE_FILE\"" <<EOF
 [Unit]
 Description=Recursive DNS Server
 After=network.target
