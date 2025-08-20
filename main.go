@@ -3,13 +3,11 @@ package main
 import (
 	"context"
 	"fmt"
-	"io" // Replaced ioutil with io
 	"log"
 	rand "math/rand/v2"
 	"net"
-	"net/http" // Required for http.Get
 	"os"
-	"strings" // Added for strings.Join
+	"strings"
 	"sync"
 	"time"
 
@@ -51,15 +49,38 @@ type NegativeCacheEntry struct {
 var NegativeCache *lru.Cache[string, NegativeCacheEntry] // LRU cache for negative responses
 
 var RootServers = []string{
-	"198.41.0.4:53",     // A.ROOT-SERVERS.NET
-	"192.228.79.201:53", // B.ROOT-SERVERS.NET (updated from 170.247.170.2)
-	"192.33.4.12:53",    // C.ROOT-SERVERS.NET
-	"199.7.91.13:53",    // D.ROOT-SERVERS.NET
-	"192.203.230.10:53", // E.ROOT-SERVERS.NET
+	"198.41.0.4:53",          // A.ROOT-SERVERS.NET (IPv4)
+	"2001:503:ba3e::2:30:53", // A.ROOT-SERVERS.NET (IPv6)
+	"170.247.170.2:53",       // B.ROOT-SERVERS.NET (IPv4)
+	"2801:1b8:10::b:53",      // B.ROOT-SERVERS.NET (IPv6)
+	"192.33.4.12:53",         // C.ROOT-SERVERS.NET (IPv4)
+	"2001:500:2::c:53",       // C.ROOT-SERVERS.NET (IPv6)
+	"199.7.91.13:53",         // D.ROOT-SERVERS.NET (IPv4)
+	"2001:500:2d::d:53",      // D.ROOT-SERVERS.NET (IPv6)
+	"192.203.230.10:53",      // E.ROOT-SERVERS.NET (IPv4)
+	"2001:500:a8::e:53",      // E.ROOT-SERVERS.NET (IPv6)
+	"192.5.5.241:53",         // F.ROOT-SERVERS.NET (IPv4)
+	"2001:500:2f::f:53",      // F.ROOT-SERVERS.NET (IPv6)
+	"192.112.36.4:53",        // G.ROOT-SERVERS.NET (IPv4)
+	"2001:500:12::d0d:53",    // G.ROOT-SERVERS.NET (IPv6)
+	"198.97.190.53:53",       // H.ROOT-SERVERS.NET (IPv4)
+	"2001:500:1::53:53",      // H.ROOT-SERVERS.NET (IPv6)
+	"192.36.148.17:53",       // I.ROOT-SERVERS.NET (IPv4)
+	"2001:7fe::53:53",        // I.ROOT-SERVERS.NET (IPv6)
+	"192.58.128.30:53",       // J.ROOT-SERVERS.NET (IPv4)
+	"2001:503:c27::2:30:53",  // J.ROOT-SERVERS.NET (IPv6)
+	"193.0.14.129:53",        // K.ROOT-SERVERS.NET (IPv4)
+	"2001:7fd::1:53",         // K.ROOT-SERVERS.NET (IPv6)
+	"199.7.83.42:53",         // L.ROOT-SERVERS.NET (IPv4)
+	"2001:500:9f::42:53",     // L.ROOT-SERVERS.NET (IPv6)
+	"202.12.27.33:53",        // M.ROOT-SERVERS.NET (IPv4)
+	"2001:dc3::35:53",        // M.ROOT-SERVERS.NET (IPv6)
 }
 
-func ResolveDNS(q dns.Question, doBit bool) (*dns.Msg, error) {
-	log.Printf("Resolving %s", q.Name)
+const globalResolutionTimeout = 10 * time.Second // Overall timeout for a single DNS resolution
+
+func ResolveDNS(ctx context.Context, q dns.Question, doBit bool) (*dns.Msg, error) {
+	log.Printf("Resolving %s (context timeout: %v)", q.Name, globalResolutionTimeout)
 
 	normalizedQName := dns.Fqdn(strings.ToLower(q.Name))
 
@@ -89,7 +110,13 @@ func ResolveDNS(q dns.Question, doBit bool) (*dns.Msg, error) {
 	)
 
 	for i := 0; i < maxRetries; i++ {
-		resp, err = ResolveRecursive(q, doBit)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err() // Propagate context cancellation
+		default:
+		}
+
+		resp, err = ResolveRecursive(ctx, q, doBit)
 		if err == nil {
 			return resp, nil
 		}
@@ -100,9 +127,15 @@ func ResolveDNS(q dns.Question, doBit bool) (*dns.Msg, error) {
 	return nil, fmt.Errorf("failed to resolve %s after %d retries: %v", q.Name, maxRetries, err)
 }
 
-func ResolveRecursive(q dns.Question, doBit bool) (*dns.Msg, error) {
+func ResolveRecursive(ctx context.Context, q dns.Question, doBit bool) (*dns.Msg, error) {
 	servers := RootServers
 	originalQuestion := q
+	// Check context cancellation at the beginning of the loop
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
 	finalMsg := new(dns.Msg)
 	finalMsg.SetQuestion(originalQuestion.Name, originalQuestion.Qtype)
 
@@ -118,7 +151,7 @@ func ResolveRecursive(q dns.Question, doBit bool) (*dns.Msg, error) {
 		log.Printf("Querying servers for %s (currentZone: %s): %v", queryName, currentZone, servers)
 
 		// Create a new question with the full name
-		resp, server, err := queryServers(dns.Question{Name: queryName, Qtype: q.Qtype, Qclass: q.Qclass}, servers, doBit)
+		resp, server, err := queryServers(ctx, dns.Question{Name: queryName, Qtype: q.Qtype, Qclass: q.Qclass}, servers, doBit)
 		if err != nil {
 			log.Printf("Error querying %s from %s: %v", queryName, server, err)
 			return nil, err
@@ -126,6 +159,10 @@ func ResolveRecursive(q dns.Question, doBit bool) (*dns.Msg, error) {
 
 		if resp.Rcode != dns.RcodeSuccess {
 			log.Printf("Query for %s failed with rcode %s from %s. Response: %s", queryName, dns.RcodeToString[resp.Rcode], server, resp.String())
+			// If the response is a server failure from an upstream, propagate it.
+			if resp.Rcode == dns.RcodeServerFailure {
+				return resp, fmt.Errorf("upstream server %s returned SERVFAIL for %s", server, queryName)
+			}
 			if len(finalMsg.Answer) > 0 { // If we collected CNAMEs, return them with the error code
 				finalMsg.Rcode = resp.Rcode
 				finalMsg.Ns = resp.Ns
@@ -188,7 +225,7 @@ func ResolveRecursive(q dns.Question, doBit bool) (*dns.Msg, error) {
 
 			if !hasGlue {
 				log.Printf("Resolving NS IPs for delegation of %s", currentZone)
-				resolvedIPs, err := resolveNS(nextServers, doBit)
+				resolvedIPs, err := resolveNS(ctx, nextServers, doBit)
 				if err != nil {
 					log.Printf("Error resolving NS IPs for %s: %v", currentZone, err)
 					return nil, err
@@ -231,11 +268,10 @@ func ResolveRecursive(q dns.Question, doBit bool) (*dns.Msg, error) {
 	return nil, fmt.Errorf("resolution depth limit exceeded for %s", originalQuestion.Name)
 }
 
-func queryServers(q dns.Question, servers []string, doBit bool) (*dns.Msg, string, error) {
-	// Set client timeout to 2-3 seconds
+func queryServers(ctx context.Context, q dns.Question, servers []string, doBit bool) (*dns.Msg, string, error) {
+	// Use the provided context for the overall query operation.
+	// The individual client timeout is still applied for each exchange.
 	clientTimeout := 5 * time.Second
-	ctx, cancel := context.WithTimeout(context.Background(), clientTimeout)
-	defer cancel()
 
 	respChan := make(chan struct {
 		Msg    *dns.Msg
@@ -284,6 +320,8 @@ func queryServers(q dns.Question, servers []string, doBit bool) (*dns.Msg, strin
 					}
 				}
 
+				// Only consider successful responses or specific error codes that indicate a definitive answer (e.g., NXDOMAIN)
+				// Do not send SERVFAIL from upstream to the channel, as we want to retry other servers.
 				if resp.Rcode != dns.RcodeServerFailure {
 					select {
 					case respChan <- struct {
@@ -292,6 +330,8 @@ func queryServers(q dns.Question, servers []string, doBit bool) (*dns.Msg, strin
 					}{resp, s}:
 					default: // Avoid blocking if another goroutine already sent a response
 					}
+				} else {
+					log.Printf("Upstream server %s returned SERVFAIL for %s. Will try other servers.", s, q.Name)
 				}
 			} else if err != nil {
 				log.Printf("Error exchanging DNS query for %s with %s: %v", q.Name, s, err)
@@ -310,10 +350,9 @@ func queryServers(q dns.Question, servers []string, doBit bool) (*dns.Msg, strin
 			// This happens if all goroutines failed without sending a response.
 			return nil, "", fmt.Errorf("all queries failed for %s", q.Name)
 		}
-		cancel() // Cancel other ongoing requests
 		return res.Msg, res.Server, nil
 	case <-ctx.Done():
-		return nil, "", fmt.Errorf("querying servers for %s timed out", q.Name)
+		return nil, "", fmt.Errorf("querying servers for %s timed out: %w", q.Name, ctx.Err())
 	}
 }
 
@@ -356,11 +395,17 @@ func extractDelegation(resp *dns.Msg) (servers []string, hasGlue bool) {
 	return
 }
 
-func resolveNS(nsNames []string, doBit bool) ([]string, error) {
+func resolveNS(ctx context.Context, nsNames []string, doBit bool) ([]string, error) {
 	var ips []string
 	for _, name := range nsNames {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err() // Propagate context cancellation
+		default:
+		}
+
 		// Recursively resolve A records for the NS name
-		aResp, err := ResolveDNS(dns.Question{Name: dns.Fqdn(name), Qtype: dns.TypeA, Qclass: dns.ClassINET}, doBit)
+		aResp, err := ResolveDNS(ctx, dns.Question{Name: dns.Fqdn(name), Qtype: dns.TypeA, Qclass: dns.ClassINET}, doBit)
 		if err == nil && aResp != nil && aResp.Rcode == dns.RcodeSuccess {
 			for _, rr := range aResp.Answer {
 				if a, ok := rr.(*dns.A); ok {
@@ -373,7 +418,7 @@ func resolveNS(nsNames []string, doBit bool) ([]string, error) {
 
 		// Recursively resolve AAAA records for the NS name if no A records were found or for more options
 		if len(ips) == 0 { // Only try AAAA if A records weren't found
-			aaaaResp, err := ResolveDNS(dns.Question{Name: dns.Fqdn(name), Qtype: dns.TypeAAAA, Qclass: dns.ClassINET}, doBit)
+			aaaaResp, err := ResolveDNS(ctx, dns.Question{Name: dns.Fqdn(name), Qtype: dns.TypeAAAA, Qclass: dns.ClassINET}, doBit)
 			if err == nil && aaaaResp != nil && aaaaResp.Rcode == dns.RcodeSuccess {
 				for _, rr := range aaaaResp.Answer {
 					if aaaa, ok := rr.(*dns.AAAA); ok {
@@ -390,50 +435,6 @@ func resolveNS(nsNames []string, doBit bool) ([]string, error) {
 		return nil, fmt.Errorf("could not resolve any NS IPs for %v", nsNames)
 	}
 	return ips, nil
-}
-
-// updateRootServers fetches the latest root server list from internic.net
-// and updates the global RootServers slice.
-func updateRootServers() {
-	log.Println("Updating root servers from https://www.internic.net/domain/named.root")
-	resp, err := http.Get("https://www.internic.net/domain/named.root")
-	if err != nil {
-		log.Printf("Error fetching named.root: %v", err)
-		return
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body) // Changed ioutil.ReadAll to io.ReadAll
-	if err != nil {
-		log.Printf("Error reading named.root response body: %v", err)
-		return
-	}
-
-	var newRootServers []string
-	lines := strings.Split(string(body), "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, ";") || line == "" {
-			continue
-		}
-
-		parts := strings.Fields(line)
-		if len(parts) >= 4 {
-			if parts[2] == "A" { // Only include IPv4 addresses
-				ip := parts[3]
-				if !strings.Contains(ip, ":") { // Ensure it's not an IPv6 address
-					newRootServers = append(newRootServers, net.JoinHostPort(ip, "53"))
-				}
-			}
-		}
-	}
-
-	if len(newRootServers) > 0 {
-		RootServers = newRootServers
-		log.Printf("Successfully updated root servers. New count: %d", len(RootServers))
-	} else {
-		log.Println("No root servers found in the fetched file. Keeping existing list.")
-	}
 }
 
 func CacheResponse(q dns.Question, resp *dns.Msg) {
@@ -543,10 +544,17 @@ func HandleDnsRequest(w dns.ResponseWriter, r *dns.Msg) {
 
 		for _, q := range m.Question {
 			log.Printf("Received query for %s from %s", q.Name, clientIP)
-			resp, err := ResolveDNS(q, doBit)
+
+			// Create a context with a timeout for the entire resolution process
+			resolveCtx, cancel := context.WithTimeout(context.Background(), globalResolutionTimeout)
+			defer cancel() // Ensure the context is cancelled when ResolveDNS returns
+
+			resp, err := ResolveDNS(resolveCtx, q, doBit)
 			if err != nil {
-				log.Printf("Error resolving %s: %v", q.Name, err)
+				log.Printf("Error resolving %s: %v. Setting RcodeServerFailure.", q.Name, err)
 				m.SetRcode(r, dns.RcodeServerFailure)
+				// Optionally, you could try to be more specific here if the error type allows.
+				// For now, sticking to SERVFAIL as it's a general server-side issue.
 			} else if resp != nil {
 				// Copy the response fields to the message 'm'
 				m.Answer = resp.Answer
@@ -577,7 +585,7 @@ func main() {
 
 	port := os.Getenv("DNS_PORT")
 	if port == "" {
-		port = "8053" // Changed default port to 8053 to avoid conflicts
+		port = "8054" // Changed default port to 8054 to avoid conflicts
 	}
 
 	go func() {
