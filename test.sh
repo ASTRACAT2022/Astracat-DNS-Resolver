@@ -2,7 +2,7 @@
 
 set -e # Exit immediately if a command exits with a non-zero status.
 
-PORT=${1:-5353}
+PORT=${1:-8053}
 SERVER="127.0.0.1"
 
 # Function to check if a record of a certain type exists
