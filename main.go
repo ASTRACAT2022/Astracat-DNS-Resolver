@@ -36,8 +36,8 @@ var (
 	seenRequests = make(map[string]time.Time) // key = remoteIP|qname -> last seen
 	seenWindow   = 5 * time.Second
 
-	inFlightMutex    sync.Mutex
-	inFlight         = make(map[string]int) // qname -> count of current resolutions
+	inFlightMutex      sync.Mutex
+	inFlight           = make(map[string]int) // qname -> count of current resolutions
 	maxInFlightPerName = 4
 )
 
@@ -117,12 +117,21 @@ func main() {
 }
 
 func handleRequest(conn *net.UDPConn, remoteAddr *net.UDPAddr, request []byte) {
+	// Восстановление от паники, чтобы единичная ошибка не делала весь сервис недоступным
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("panic recovered in handleRequest: %v", r)
+			// Попытаться ответить клиенту SERVFAIL (но не ломать остальной процесс)
+			_ = safeSendError(conn, remoteAddr, request, dns.RcodeServerFailure)
+		}
+	}()
+
 	startTime := time.Now()
 	// Парсим входящий DNS-запрос
 	msg := new(dns.Msg)
 	if err := msg.Unpack(request); err != nil {
 		log.Printf("Error unpacking DNS request from %s: %v", remoteAddr.String(), err)
-		sendErrorResponse(conn, remoteAddr, msg, dns.RcodeServerFailure)
+		_ = safeSendError(conn, remoteAddr, msg, dns.RcodeFormatError)
 		return
 	}
 	defer func() {
@@ -134,7 +143,7 @@ func handleRequest(conn *net.UDPConn, remoteAddr *net.UDPAddr, request []byte) {
 	questions := msg.Question
 	if len(questions) == 0 {
 		// Нет вопросов — ничего делать
-		sendErrorResponse(conn, remoteAddr, msg, dns.RcodeFormatError)
+		_ = safeSendError(conn, remoteAddr, msg, dns.RcodeFormatError)
 		return
 	}
 
@@ -152,22 +161,23 @@ func handleRequest(conn *net.UDPConn, remoteAddr *net.UDPAddr, request []byte) {
 		qname := q.Name
 		// Защита: если запрос пришёл с IP, который равен одному из локальных интерфейсов — это цикл
 		if isLoopDetected(remoteAddr.IP) {
-			log.Printf("Detected direct loop from %s for %s — ignored", remoteAddr.String(), qname)
-			sendErrorResponse(conn, remoteAddr, msg, dns.RcodeServerFailure)
+			log.Printf("Detected direct loop from %s for %s — refused", remoteAddr.String(), qname)
+			// Отвечаем REFUSED — это более точный ответ для отбрасывания нежелательных запросов
+			_ = safeSendError(conn, remoteAddr, msg, dns.RcodeRefused)
 			return
 		}
 
 		// seen-cache: если тот же IP часто запрашивает то же имя — признак зацикливания или флода
 		if seenLikelyLoop(remoteAddr.IP, qname) {
-			log.Printf("Seen-based loop/flood detected from %s for %s — ignored", remoteAddr.String(), qname)
-			sendErrorResponse(conn, remoteAddr, msg, dns.RcodeServerFailure)
+			log.Printf("Seen-based loop/flood detected from %s for %s — refused", remoteAddr.String(), qname)
+			_ = safeSendError(conn, remoteAddr, msg, dns.RcodeRefused)
 			return
 		}
 
 		// Попробуем войти в in-flight для этого имени; если много одновременных — считаем цикл/флуд
 		if !enterInFlight(qname) {
-			log.Printf("In-flight limit exceeded for %s (from %s) — ignored", qname, remoteAddr.String())
-			sendErrorResponse(conn, remoteAddr, msg, dns.RcodeServerFailure)
+			log.Printf("In-flight limit exceeded for %s (from %s) — refused", qname, remoteAddr.String())
+			_ = safeSendError(conn, remoteAddr, msg, dns.RcodeRefused)
 			return
 		}
 		// Успешно вошли — запомним, чтобы снять метку в конце
@@ -225,6 +235,7 @@ func handleRequest(conn *net.UDPConn, remoteAddr *net.UDPAddr, request []byte) {
 		answers, err := resolveQuestion(q)
 		if err != nil {
 			log.Printf("Error resolving DNS question for %s from %s: %v", q.Name, remoteAddr.String(), err)
+			// Для отдельных вопросов возвращаем NXDOMAIN (Name Error) — но не превращаемся в глобальный SERVFAIL
 			responseMsg.SetRcode(msg, dns.RcodeNameError)
 			continue
 		}
@@ -235,7 +246,7 @@ func handleRequest(conn *net.UDPConn, remoteAddr *net.UDPAddr, request []byte) {
 	responseBytes, err := responseMsg.Pack()
 	if err != nil {
 		log.Printf("Error packing DNS response for %s from %s: %v", cacheKey, remoteAddr.String(), err)
-		sendErrorResponse(conn, remoteAddr, msg, dns.RcodeServerFailure)
+		_ = safeSendError(conn, remoteAddr, msg, dns.RcodeServerFailure)
 		return
 	}
 
@@ -254,6 +265,41 @@ func handleRequest(conn *net.UDPConn, remoteAddr *net.UDPAddr, request []byte) {
 	if err != nil {
 		log.Printf("Error sending response to %s: %v", remoteAddr.String(), err)
 	}
+}
+
+// safeSendError формирует и отправляет ответ об ошибке, но гарантирует отсутствие паники
+func safeSendError(conn *net.UDPConn, remoteAddr *net.UDPAddr, msgOrRaw interface{}, rcode int) error {
+	var msg *dns.Msg
+	switch v := msgOrRaw.(type) {
+	case *dns.Msg:
+		msg = v
+	case []byte:
+		// Попытка распарсить исходный запрос, чтобы корректно установить ID
+		m := new(dns.Msg)
+		if err := m.Unpack(v); err == nil {
+			msg = m
+		}
+	}
+
+	responseMsg := new(dns.Msg)
+	if msg != nil {
+		responseMsg.SetRcode(msg, rcode)
+		responseMsg.Id = msg.Id
+	} else {
+		// Нет исходного msg — создаём минимальный ответ
+		responseMsg.MsgHdr.Rcode = rcode
+	}
+	responseMsg.Compress = false
+	responseBytes, err := responseMsg.Pack()
+	if err != nil {
+		log.Printf("Ошибка упаковки служебного ответа: %v", err)
+		return err
+	}
+	_, err = conn.WriteToUDP(responseBytes, remoteAddr)
+	if err != nil {
+		log.Printf("Ошибка отправки служебного ответа по UDP: %v", err)
+	}
+	return err
 }
 
 // --- Helpers for loop/flood protection ---
@@ -325,17 +371,20 @@ func resolveQuestion(q dns.Question) ([]dns.RR, error) {
 
 	// Преобразуем dnsr.RRs в dns.RR
 	for _, rr := range rrs {
-		hdr := dns.RR_Header{Name: dns.Fqdn(rr.Name), Rrtype: dns.StringToType[rr.Type], Class: dns.ClassINET, Ttl: uint32(rr.TTL / time.Second)}
+		// Защита: если тип неизвестен — пропустим запись, но не ломаем весь ответ
+		rtype := dns.StringToType[rr.Type]
+		if rtype == 0 {
+			log.Printf("Skipping unknown RR type %q for %s", rr.Type, rr.Name)
+			continue
+		}
+		hdr := dns.RR_Header{Name: dns.Fqdn(rr.Name), Rrtype: rtype, Class: dns.ClassINET, Ttl: uint32(rr.TTL / time.Second)}
 		switch rr.Type {
 		case "A":
 			ip := net.ParseIP(rr.Value)
 			if ip == nil || ip.To4() == nil {
 				continue
 			}
-			answers = append(answers, &dns.A{
-				Hdr: hdr,
-				A:   ip.To4(),
-			})
+			answers = append(answers, &dns.A{Hdr: hdr, A: ip.To4()})
 		case "AAAA":
 			ip := net.ParseIP(rr.Value)
 			if ip == nil {
@@ -346,35 +395,20 @@ func resolveQuestion(q dns.Question) ([]dns.RR, error) {
 				log.Printf("Invalid AAAA record for %s: %s", q.Name, rr.Value)
 				continue
 			}
-			answers = append(answers, &dns.AAAA{
-				Hdr:  hdr,
-				AAAA: ip,
-			})
+			answers = append(answers, &dns.AAAA{Hdr: hdr, AAAA: ip})
 		case "MX":
-			answers = append(answers, &dns.MX{
-				Hdr:        hdr,
-				Preference: 10,
-				Mx:         dns.Fqdn(rr.Value),
-			})
+			answers = append(answers, &dns.MX{Hdr: hdr, Preference: 10, Mx: dns.Fqdn(rr.Value)})
 		case "NS":
-			answers = append(answers, &dns.NS{
-				Hdr: hdr,
-				Ns:  dns.Fqdn(rr.Value),
-			})
+			answers = append(answers, &dns.NS{Hdr: hdr, Ns: dns.Fqdn(rr.Value)})
 		case "CNAME":
-			answers = append(answers, &dns.CNAME{
-				Hdr:    hdr,
-				Target: dns.Fqdn(rr.Value),
-			})
+			answers = append(answers, &dns.CNAME{Hdr: hdr, Target: dns.Fqdn(rr.Value)})
 		case "TXT":
-			answers = append(answers, &dns.TXT{
-				Hdr: hdr,
-				Txt: []string{rr.Value},
-			})
+			answers = append(answers, &dns.TXT{Hdr: hdr, Txt: []string{rr.Value}})
 		case "SOA":
 			continue
 		default:
-			log.Printf("Unsupported record type: %s for %s", rr.Type, rr.Name)
+			// остальные поддерживаемые типы пропускаем здесь — если нужно, добавим позже
+			log.Printf("Unsupported record type: %s for %s — skipped", rr.Type, rr.Name)
 			continue
 		}
 	}
@@ -404,28 +438,4 @@ func isLoopDetected(remoteIP net.IP) bool {
 
 func printCacheStats() {
 	log.Printf("Cache hits: %d, cache misses: %d", cacheHits, cacheMisses)
-}
-
-func sendErrorResponse(conn *net.UDPConn, remoteAddr *net.UDPAddr, msg *dns.Msg, rcode int) {
-	responseMsg := new(dns.Msg)
-	// если msg == nil — сформируем пустой ответ с RCODE
-	if msg != nil {
-		responseMsg.SetRcode(msg, rcode)
-	} else {
-		responseMsg.MsgHdr.Rcode = rcode
-	}
-	responseMsg.Compress = false
-	if msg != nil {
-		responseMsg.Id = msg.Id // Устанавливаем правильный ID (если он есть)
-	}
-	responseBytes, err := responseMsg.Pack()
-	if err != nil {
-		log.Printf("Ошибка упаковки ответа об ошибке: %v", err)
-		return
-	}
-	_, err = conn.WriteToUDP(responseBytes, remoteAddr)
-	if err != nil {
-		log.Printf("Ошибка отправки ответа об ошибке по UDP: %v", err)
-	}
-	printCacheStats()
 }
