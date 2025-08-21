@@ -189,7 +189,7 @@ func resolveQuestion(q dns.Question) ([]dns.RR, error) {
 	var answers []dns.RR
 
 	// Создаём контекст с таймаутом
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	_, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	// Преобразуем тип запроса в строку для dnsr
