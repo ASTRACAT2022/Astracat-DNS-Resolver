@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net"
@@ -28,16 +29,31 @@ var (
 	cacheMisses int
 	cacheMutex  sync.RWMutex
 	resolver    *dnsr.Resolver
+	localAddrs  []net.IP // Список локальных IP-адресов сервера
 )
 
 func init() {
 	// Инициализируем Resolver из пакета dnsr
 	resolver = dnsr.NewResolver(
-		dnsr.WithCache(10000),            // Кэш на 10000 записей, как в примере
+		dnsr.WithCache(10000),         // Кэш на 10000 записей, как в примере
 		dnsr.WithTimeout(10*time.Second), // Увеличенный таймаут 10 секунд
-		dnsr.WithExpiry(),                // Очистка устаревших записей по TTL
-		dnsr.WithTCPRetry(),              // Повтор по TCP при усечении
+		dnsr.WithExpiry(),              // Очистка устаревших записей по TTL
+		dnsr.WithTCPRetry(),            // Повтор по TCP при усечении
 	)
+
+	// Получаем локальные IP-адреса для предотвращения зацикливания
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		log.Fatalf("Ошибка при получении сетевых интерфейсов: %v", err)
+	}
+	for _, a := range addrs {
+		if ipnet, ok := a.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
+			if ipnet.IP.To4() != nil {
+				localAddrs = append(localAddrs, ipnet.IP)
+			}
+		}
+	}
+	log.Printf("Обнаружены локальные IP-адреса: %v", localAddrs)
 }
 
 func main() {
@@ -74,6 +90,12 @@ func main() {
 }
 
 func handleRequest(conn *net.UDPConn, remoteAddr *net.UDPAddr, request []byte) {
+	// Защита от зацикливания: игнорируем запросы от самого себя
+	if isLoopDetected(remoteAddr.IP) {
+		log.Printf("Обнаружен цикл DNS-запроса от %s. Запрос проигнорирован.", remoteAddr.String())
+		return
+	}
+
 	startTime := time.Now()
 	// Парсим входящий DNS-запрос
 	msg := new(dns.Msg)
@@ -166,6 +188,10 @@ func handleRequest(conn *net.UDPConn, remoteAddr *net.UDPAddr, request []byte) {
 func resolveQuestion(q dns.Question) ([]dns.RR, error) {
 	var answers []dns.RR
 
+	// Создаём контекст с таймаутом
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
 	// Преобразуем тип запроса в строку для dnsr
 	qtype := dns.TypeToString[q.Qtype]
 	if qtype == "" {
@@ -248,6 +274,19 @@ func resolveQuestion(q dns.Question) ([]dns.RR, error) {
 	}
 
 	return answers, nil
+}
+
+func isLoopDetected(remoteIP net.IP) bool {
+	// Проверяем, является ли удалённый IP-адрес локальным или адресом петли
+	if remoteIP.IsLoopback() {
+		return true
+	}
+	for _, localIP := range localAddrs {
+		if localIP.Equal(remoteIP) {
+			return true
+		}
+	}
+	return false
 }
 
 func printCacheStats() {
