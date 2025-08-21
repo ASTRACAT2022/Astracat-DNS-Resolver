@@ -5,7 +5,10 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"os"
+	"os/signal"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/domainr/dnsr"
@@ -23,68 +26,80 @@ type cacheEntry struct {
 	expiry   time.Time
 }
 
+// seenEntry для защиты от быстрых повторных запросов
+type seenEntry struct {
+	count int
+	last  time.Time
+}
+
 var (
 	cache       = make(map[string]cacheEntry)
 	cacheHits   int
 	cacheMisses int
 	cacheMutex  sync.RWMutex
-	resolver    *dnsr.Resolver
-	localAddrs  []net.IP // Список локальных IP-адресов сервера
+
+	resolver   *dnsr.Resolver
+	localAddrs []net.IP // Список локальных IP-адресов сервера
 
 	// Защита от циклов / флуда
-	seenMutex    sync.Mutex
-	seenRequests = make(map[string]time.Time) // key = remoteIP|qname -> last seen
-	seenWindow   = 5 * time.Second
+	seenMutex          sync.Mutex
+	seenRequests       = make(map[string]*seenEntry) // key = remoteIP|qname -> entry
+	seenWindow         = 5 * time.Second
+	seenCountThreshold = 3 // блокируем только после X повторов в окне
 
 	inFlightMutex      sync.Mutex
 	inFlight           = make(map[string]int) // qname -> count of current resolutions
-	maxInFlightPerName = 4
+	maxInFlightPerName = 10
 )
 
-func init() {
-	// Инициализируем Resolver из пакета dnsr
+func initResolver() {
 	resolver = dnsr.NewResolver(
-		dnsr.WithCache(10000),           // Кэш на 10000 записей, как в примере
-		dnsr.WithTimeout(10*time.Second), // Увеличенный таймаут 10 секунд
-		dnsr.WithExpiry(),               // Очистка устаревших записей по TTL
-		dnsr.WithTCPRetry(),             // Повтор по TCP при усечении
+		dnsr.WithCache(10000),
+		dnsr.WithTimeout(10*time.Second),
+		dnsr.WithExpiry(),
+		dnsr.WithTCPRetry(),
 	)
+}
 
-	// Получаем локальные IP-адреса для предотвращения зацикливания
+func gatherLocalAddrs() {
 	addrs, err := net.InterfaceAddrs()
 	if err != nil {
 		log.Fatalf("Ошибка при получении сетевых интерфейсов: %v", err)
 	}
 	for _, a := range addrs {
 		if ipnet, ok := a.(*net.IPNet); ok {
-			// Не добавляем loopback в localAddrs — это позволит тестировать через 127.0.0.1
 			if ipnet.IP.IsLoopback() {
+				// не добавляем loopback — хотим разрешать тесты с 127.0.0.1
 				continue
 			}
 			localAddrs = append(localAddrs, ipnet.IP)
 		}
 	}
 	log.Printf("Обнаружены локальные IP-адреса: %v", localAddrs)
+}
 
-	// Фоновая горутина для периодической очистки seenRequests (чтобы карта не разрасталась)
+func main() {
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+
+	initResolver()
+	gatherLocalAddrs()
+
+	// Фоновая очистка seenRequests
 	go func() {
 		ticker := time.NewTicker(1 * time.Minute)
 		defer ticker.Stop()
 		for range ticker.C {
 			now := time.Now()
 			seenMutex.Lock()
-			for k, t := range seenRequests {
-				if now.Sub(t) > 10*seenWindow {
+			for k, e := range seenRequests {
+				if now.Sub(e.last) > 10*seenWindow {
 					delete(seenRequests, k)
 				}
 			}
 			seenMutex.Unlock()
 		}
 	}()
-}
 
-func main() {
-	// Запускаем DNS-сервер
 	addr := fmt.Sprintf(":%d", listenPort)
 	udpAddr, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
@@ -99,17 +114,28 @@ func main() {
 
 	log.Printf("DNS-резолвер запущен на UDP-порту %d", listenPort)
 
-	// Буфер для входящих запросов — увеличен для поддержки EDNS
-	buffer := make([]byte, 4096)
+	// Обработка сигналов для аккуратного завершения
+	sigc := make(chan os.Signal, 1)
+	signal.Notify(sigc, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigc
+		log.Printf("Shutting down")
+		conn.Close()
+		os.Exit(0)
+	}()
 
+	buffer := make([]byte, 4096)
 	for {
 		n, remoteAddr, err := conn.ReadFromUDP(buffer)
 		if err != nil {
+			// если conn.Close() вызван выше — выйдем
+			if opErr, ok := err.(*net.OpError); ok && opErr.Err.Error() == "use of closed network connection" {
+				return
+			}
 			log.Printf("Ошибка чтения из UDP: %v", err)
 			continue
 		}
 
-		// Копируем буфер для избежания гонки данных
 		requestCopy := make([]byte, n)
 		copy(requestCopy, buffer[:n])
 		go handleRequest(conn, remoteAddr, requestCopy)
@@ -117,17 +143,15 @@ func main() {
 }
 
 func handleRequest(conn *net.UDPConn, remoteAddr *net.UDPAddr, request []byte) {
-	// Восстановление от паники, чтобы единичная ошибка не делала весь сервис недоступным
+	// recover, чтобы единичная паника не уронила процесс
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("panic recovered in handleRequest: %v", r)
-			// Попытаться ответить клиенту SERVFAIL (но не ломать остальной процесс)
 			_ = safeSendError(conn, remoteAddr, request, dns.RcodeServerFailure)
 		}
 	}()
 
-	startTime := time.Now()
-	// Парсим входящий DNS-запрос
+	start := time.Now()
 	msg := new(dns.Msg)
 	if err := msg.Unpack(request); err != nil {
 		log.Printf("Error unpacking DNS request from %s: %v", remoteAddr.String(), err)
@@ -135,88 +159,70 @@ func handleRequest(conn *net.UDPConn, remoteAddr *net.UDPAddr, request []byte) {
 		return
 	}
 	defer func() {
-		duration := time.Since(startTime)
-		log.Printf("Request from %s processed in %v", remoteAddr.String(), duration)
+		log.Printf("Request from %s processed in %v", remoteAddr.String(), time.Since(start))
 	}()
 
-	// Формируем ключи вопросов и проверяем защиту от циклов / флуда
-	questions := msg.Question
-	if len(questions) == 0 {
-		// Нет вопросов — ничего делать
+	if len(msg.Question) == 0 {
 		_ = safeSendError(conn, remoteAddr, msg, dns.RcodeFormatError)
 		return
 	}
 
-	// Список имён, которые мы пометили как in-flight (надо будет снять метку в конце)
+	// Проверки на цикл/флуд — делаем заранее
 	var entered []string
 	defer func() {
-		// Снимаем in-flight флаги для всех вошедших имён
 		for _, name := range entered {
 			leaveInFlight(name)
 		}
 	}()
 
-	// Сначала проверяем все вопросы на быстрые признаки петли/флуда
-	for _, q := range questions {
+	for _, q := range msg.Question {
 		qname := q.Name
-		// Защита: если запрос пришёл с IP, который равен одному из локальных интерфейсов — это цикл
 		if isLoopDetected(remoteAddr.IP) {
 			log.Printf("Detected direct loop from %s for %s — refused", remoteAddr.String(), qname)
-			// Отвечаем REFUSED — это более точный ответ для отбрасывания нежелательных запросов
 			_ = safeSendError(conn, remoteAddr, msg, dns.RcodeRefused)
 			return
 		}
 
-		// seen-cache: если тот же IP часто запрашивает то же имя — признак зацикливания или флода
 		if seenLikelyLoop(remoteAddr.IP, qname) {
 			log.Printf("Seen-based loop/flood detected from %s for %s — refused", remoteAddr.String(), qname)
 			_ = safeSendError(conn, remoteAddr, msg, dns.RcodeRefused)
 			return
 		}
 
-		// Попробуем войти в in-flight для этого имени; если много одновременных — считаем цикл/флуд
 		if !enterInFlight(qname) {
 			log.Printf("In-flight limit exceeded for %s (from %s) — refused", qname, remoteAddr.String())
 			_ = safeSendError(conn, remoteAddr, msg, dns.RcodeRefused)
 			return
 		}
-		// Успешно вошли — запомним, чтобы снять метку в конце
 		entered = append(entered, qname)
 	}
 
-	// Формируем ключ кэша для первого вопрос (как раньше)
+	// Ключ кэша для первого вопроса
 	cacheKey := ""
-	if len(msg.Question) > 0 {
-		q := msg.Question[0]
-		cacheKey = fmt.Sprintf("%s_%d", q.Name, q.Qtype)
-	}
+	firstQ := msg.Question[0]
+	cacheKey = fmt.Sprintf("%s_%d", firstQ.Name, firstQ.Qtype)
 
-	// Проверяем кэш приложения
+	// Проверка кэша
 	if cacheKey != "" {
 		cacheMutex.RLock()
 		entry, found := cache[cacheKey]
 		if found && time.Now().Before(entry.expiry) {
-			// Копируем ответ локально и снимаем RLock
 			resp := make([]byte, len(entry.response))
 			copy(resp, entry.response)
 			cacheMutex.RUnlock()
 
 			cacheHits++
-			// Обновляем ID для кэшированного ответа
 			cachedMsg := new(dns.Msg)
 			if err := cachedMsg.Unpack(resp); err == nil {
 				cachedMsg.Id = msg.Id
-				responseBytes, err := cachedMsg.Pack()
-				if err == nil {
-					_, err = conn.WriteToUDP(responseBytes, remoteAddr)
-					if err != nil {
+				if b, err := cachedMsg.Pack(); err == nil {
+					if _, err := conn.WriteToUDP(b, remoteAddr); err != nil {
 						log.Printf("Error sending cached response to %s: %v", remoteAddr.String(), err)
 					}
 					log.Printf("Cache hit for %s from %s", cacheKey, remoteAddr.String())
 				}
 				return
 			}
-			// Если распаковка не удалась — продолжаем как cache miss
 		} else {
 			cacheMutex.RUnlock()
 			cacheMisses++
@@ -224,103 +230,122 @@ func handleRequest(conn *net.UDPConn, remoteAddr *net.UDPAddr, request []byte) {
 		}
 	}
 
-	// Создаём ответ
+	// Формируем ответ
 	responseMsg := new(dns.Msg)
 	responseMsg.SetReply(msg)
 	responseMsg.Compress = false
-	responseMsg.Id = msg.Id // Устанавливаем правильный ID
+	responseMsg.Id = msg.Id
 
-	// Обрабатываем вопросы с помощью dnsr.Resolver
+	anyAnswers := false
+	anyNX := false
+
 	for _, q := range msg.Question {
 		answers, err := resolveQuestion(q)
 		if err != nil {
-			log.Printf("Error resolving DNS question for %s from %s: %v", q.Name, remoteAddr.String(), err)
-			// Для отдельных вопросов возвращаем NXDOMAIN (Name Error) — но не превращаемся в глобальный SERVFAIL
-			responseMsg.SetRcode(msg, dns.RcodeNameError)
+			log.Printf("Error resolving %s: %v", q.Name, err)
+			// Если это NXDOMAIN в dnsr — помечаем как NX
+			if err != nil && err.Error() != "" {
+				// Попытка определения NXDOMAIN по тексту ошибки dnsr
+				// dnsr.ResolveErr возвращает dnsr.NXDOMAIN в ошибке, но сравнение по константе может быть ненадёжным
+				// Здесь мы пометим как NX, но не превратим весь ответ в SERVFAIL
+				anyNX = true
+			}
 			continue
 		}
-		responseMsg.Answer = append(responseMsg.Answer, answers...)
+		if len(answers) > 0 {
+			responseMsg.Answer = append(responseMsg.Answer, answers...)
+			anyAnswers = true
+		}
 	}
 
-	// Упаковываем ответ
+	// Устанавливаем RCODE: если есть ответы — success, иначе NX или SERVFAIL
+	if anyAnswers {
+		responseMsg.MsgHdr.Rcode = dns.RcodeSuccess
+	} else if anyNX {
+		responseMsg.MsgHdr.Rcode = dns.RcodeNameError
+	} else {
+		responseMsg.MsgHdr.Rcode = dns.RcodeServerFailure
+	}
+
 	responseBytes, err := responseMsg.Pack()
 	if err != nil {
-		log.Printf("Error packing DNS response for %s from %s: %v", cacheKey, remoteAddr.String(), err)
+		log.Printf("Error packing DNS response for %s: %v", cacheKey, err)
 		_ = safeSendError(conn, remoteAddr, msg, dns.RcodeServerFailure)
 		return
 	}
 
-	// Сохраняем в кэш приложения, если есть ответы
-	if cacheKey != "" && len(responseMsg.Answer) > 0 {
+	// Сохраняем в кэш для первого вопроса
+	if cacheKey != "" && anyAnswers {
 		cacheMutex.Lock()
-		cache[cacheKey] = cacheEntry{
-			response: responseBytes,
-			expiry:   time.Now().Add(cacheTTL),
-		}
+		cache[cacheKey] = cacheEntry{response: responseBytes, expiry: time.Now().Add(cacheTTL)}
 		cacheMutex.Unlock()
 	}
 
-	// Отправляем ответ клиенту
-	_, err = conn.WriteToUDP(responseBytes, remoteAddr)
-	if err != nil {
+	// Отправляем
+	if _, err := conn.WriteToUDP(responseBytes, remoteAddr); err != nil {
 		log.Printf("Error sending response to %s: %v", remoteAddr.String(), err)
 	}
 }
 
-// safeSendError формирует и отправляет ответ об ошибке, но гарантирует отсутствие паники
+// safeSendError формирует и отправляет ответ об ошибке без паники
 func safeSendError(conn *net.UDPConn, remoteAddr *net.UDPAddr, msgOrRaw interface{}, rcode int) error {
 	var msg *dns.Msg
 	switch v := msgOrRaw.(type) {
 	case *dns.Msg:
 		msg = v
 	case []byte:
-		// Попытка распарсить исходный запрос, чтобы корректно установить ID
 		m := new(dns.Msg)
 		if err := m.Unpack(v); err == nil {
 			msg = m
 		}
 	}
 
-	responseMsg := new(dns.Msg)
+	resp := new(dns.Msg)
 	if msg != nil {
-		responseMsg.SetRcode(msg, rcode)
-		responseMsg.Id = msg.Id
+		resp.SetReply(msg)
+		resp.MsgHdr.Rcode = rcode
+		resp.Id = msg.Id
 	} else {
-		// Нет исходного msg — создаём минимальный ответ
-		responseMsg.MsgHdr.Rcode = rcode
+		resp.MsgHdr.Rcode = rcode
 	}
-	responseMsg.Compress = false
-	responseBytes, err := responseMsg.Pack()
+	resp.Compress = false
+	b, err := resp.Pack()
 	if err != nil {
 		log.Printf("Ошибка упаковки служебного ответа: %v", err)
 		return err
 	}
-	_, err = conn.WriteToUDP(responseBytes, remoteAddr)
-	if err != nil {
+	if _, err := conn.WriteToUDP(b, remoteAddr); err != nil {
 		log.Printf("Ошибка отправки служебного ответа по UDP: %v", err)
+		return err
 	}
-	return err
+	return nil
 }
 
-// --- Helpers for loop/flood protection ---
-
-// seenLikelyLoop возвращает true, если по seen-cache запрос выглядит как цикл/флуд
+// seenLikelyLoop возвращает true, если по seen-cache запрос выглядит как цикл/флуд.
+// Блокируем только когда count >= seenCountThreshold в пределах seenWindow.
 func seenLikelyLoop(remoteIP net.IP, qname string) bool {
 	if remoteIP == nil {
 		return false
 	}
 	key := fmt.Sprintf("%s|%s", remoteIP.String(), qname)
 	now := time.Now()
+
 	seenMutex.Lock()
 	defer seenMutex.Unlock()
-	if t, ok := seenRequests[key]; ok {
-		if now.Sub(t) < seenWindow {
-			// обновим таймстемп и вернём true (потенциальный цикл или атакующий флод)
-			seenRequests[key] = now
-			return true
-		}
+
+	e, ok := seenRequests[key]
+	if !ok || now.Sub(e.last) > seenWindow {
+		seenRequests[key] = &seenEntry{count: 1, last: now}
+		return false
 	}
-	seenRequests[key] = now
+
+	e.count++
+	e.last = now
+	if e.count >= seenCountThreshold {
+		log.Printf("seenLikelyLoop: %s requested %s %d times within %v — treating as loop/flood",
+			remoteIP.String(), qname, e.count, seenWindow)
+		return true
+	}
 	return false
 }
 
@@ -350,17 +375,16 @@ func leaveInFlight(qname string) {
 func resolveQuestion(q dns.Question) ([]dns.RR, error) {
 	var answers []dns.RR
 
-	// Создаём контекст с таймаутом (пока используется только для возможной будущей интеграции)
-	_, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// Контекст с таймаутом — пока не передаём в dnsr, но оставим для расширений
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	_ = ctx
 
-	// Преобразуем тип запроса в строку для dnsr
 	qtype := dns.TypeToString[q.Qtype]
 	if qtype == "" {
 		return nil, fmt.Errorf("unsupported query type %d for %s", q.Qtype, q.Name)
 	}
 
-	// Используем Resolver для разрешения запроса
 	rrs, err := resolver.ResolveErr(q.Name, qtype)
 	if err != nil {
 		if err == dnsr.NXDOMAIN {
@@ -369,9 +393,7 @@ func resolveQuestion(q dns.Question) ([]dns.RR, error) {
 		return nil, fmt.Errorf("failed to resolve %s %s: %w", q.Name, qtype, err)
 	}
 
-	// Преобразуем dnsr.RRs в dns.RR
 	for _, rr := range rrs {
-		// Защита: если тип неизвестен — пропустим запись, но не ломаем весь ответ
 		rtype := dns.StringToType[rr.Type]
 		if rtype == 0 {
 			log.Printf("Skipping unknown RR type %q for %s", rr.Type, rr.Name)
@@ -387,11 +409,7 @@ func resolveQuestion(q dns.Question) ([]dns.RR, error) {
 			answers = append(answers, &dns.A{Hdr: hdr, A: ip.To4()})
 		case "AAAA":
 			ip := net.ParseIP(rr.Value)
-			if ip == nil {
-				log.Printf("Invalid AAAA record for %s: %s", q.Name, rr.Value)
-				continue
-			}
-			if ip.To16() == nil || ip.To4() != nil {
+			if ip == nil || ip.To16() == nil || ip.To4() != nil {
 				log.Printf("Invalid AAAA record for %s: %s", q.Name, rr.Value)
 				continue
 			}
@@ -407,7 +425,6 @@ func resolveQuestion(q dns.Question) ([]dns.RR, error) {
 		case "SOA":
 			continue
 		default:
-			// остальные поддерживаемые типы пропускаем здесь — если нужно, добавим позже
 			log.Printf("Unsupported record type: %s for %s — skipped", rr.Type, rr.Name)
 			continue
 		}
@@ -418,13 +435,10 @@ func resolveQuestion(q dns.Question) ([]dns.RR, error) {
 	if len(answers) == 0 && len(rrs) == 0 {
 		return nil, fmt.Errorf("no records found for %s %s", q.Name, qtype)
 	}
-
 	return answers, nil
 }
 
 func isLoopDetected(remoteIP net.IP) bool {
-	// Проверяем, является ли удалённый IP-адрес одним из локальных интерфейсов сервера.
-	// Не считаем loopback (127.0.0.1 / ::1) за цикл, чтобы можно было тестировать локально через dig.
 	if remoteIP == nil {
 		return false
 	}
