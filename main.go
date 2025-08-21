@@ -412,7 +412,7 @@ func sendErrorResponse(conn *net.UDPConn, remoteAddr *net.UDPAddr, msg *dns.Msg,
 	if msg != nil {
 		responseMsg.SetRcode(msg, rcode)
 	} else {
-		responseMsg.MsgHdr.Rcode = uint16(rcode)
+		responseMsg.MsgHdr.Rcode = rcode
 	}
 	responseMsg.Compress = false
 	if msg != nil {
