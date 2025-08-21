@@ -1,138 +1,198 @@
-# dns-g
+# DNS Resolver
 
-This is a recursive DNS server written in Go, aiming for speed, performance, and stability. It supports both IPv4 and IPv6, includes retry logic with exponential backoff for external queries, and uses a simple in-memory cache.
+Полноценный DNS resolver, использующий библиотеку [dnsr](https://github.com/domainr/dnsr), созданный как аналог PowerDNS с высокой производительностью и кэшированием.
 
-## Features
+## Особенности
 
-*   **Recursive DNS Resolution:** Resolves domain names by querying authoritative DNS servers, starting from root servers.
-*   **IPv4 & IPv6 Support:** Handles DNS queries and delegates resolution over both IPv4 and IPv6.
-*   **Retry Logic:** Implements exponential backoff for retrying failed queries to upstream DNS servers, enhancing stability.
-*   **DNS Caching:** Basic in-memory caching to speed up responses for frequently requested domains.
-*   **UDP & TCP Support:** Listens for DNS queries on both UDP and TCP port 53.
-*   **Systemd Service:** Can be installed and managed as a systemd service for persistent operation on Linux (Ubuntu).
-*   **Configurable Port:** The listening port can be easily configured during installation.
+- **Высокая производительность**: Обработка запросов за микросекунды благодаря эффективному кэшированию
+- **Многоуровневое кэширование**: 
+  - Внутренний кэш dnsr библиотеки (10,000 записей)
+  - Кэш приложения с TTL 5 минут
+- **Поддержка всех основных типов записей**: A, AAAA, CNAME, MX, NS, TXT
+- **Конкурентная обработка**: Каждый запрос обрабатывается в отдельной горутине
+- **Автоматическое повторение по TCP**: При усечении UDP пакетов
+- **Детальное логирование**: Время обработки, статистика кэша, ошибки
 
-## Deployment on Ubuntu
+## Требования
 
-This guide will walk you through deploying the DNS server on an Ubuntu server using the provided `install.sh` script.
+- Go 1.25.0+
+- Доступ к интернету для разрешения DNS запросов
 
-### Prerequisites
+## Установка и запуск
 
-*   An Ubuntu server (e.g., Ubuntu 20.04 LTS or newer).
-*   `sudo` privileges on the server.
-*   `git` installed on the server (usually pre-installed).
-
-### Installation Steps
-
-1.  **Connect to your Ubuntu server via SSH:**
-
-    ```bash
-    ssh your_user@your_server_ip
-    ```
-    (Replace `your_user` with your username and `your_server_ip` with your server's IP address or hostname.)
-
-2.  **Clone the repository:**
-
-    Navigate to your desired directory (e.g., your home directory) and clone the `dns-g` repository:
-
-    ```bash
-    git clone https://github.com/ASTRACAT2022/dns-g.git
-    cd dns-g
-    ```
-
-3.  **Make the installation script executable:**
-
-    ```bash
-    chmod +x install.sh
-    ```
-
-4.  **Run the installation script:**
-
-    The `install.sh` script will perform the following actions:
-    *   Check for and install Go (if not already present).
-    *   Copy the server source files to `/opt/dns-g`.
-    *   Download Go modules and build the `dns-server` executable.
-    *   Set up and start the `dns-g-server` as a systemd service.
-
-    You can run the script with or without a custom port:
-
-    *   **To install on the default DNS port (53 UDP/TCP):**
-
-        ```bash
-        sudo ./install.sh
-        ```
-
-    *   **To install on a custom port (e.g., 5353 UDP/TCP):**
-
-        ```bash
-        sudo ./install.sh 5353
-        ```
-        (Replace `5353` with your desired port.)
-
-### Post-Installation & Management
-
-*   **Check Server Status:**
-
-    To verify that the DNS server is running correctly as a systemd service:
-
-    ```bash
-    sudo systemctl status dns-g-server
-    ```
-
-*   **Stop the Server:**
-
-    ```bash
-    sudo systemctl stop dns-g-server
-    ```
-
-*   **Start the Server:**
-
-    ```bash
-    sudo systemctl start dns-g-server
-    ```
-
-*   **Restart the Server:**
-
-    ```bash
-    sudo systemctl restart dns-g-server
-    ```
-
-*   **Firewall Configuration (Important!):
-**
-    If your Ubuntu server has a firewall (e.g., UFW) enabled, you must open the port that your DNS server is listening on. For the default port 53, you would allow both UDP and TCP:
-
-    ```bash
-    sudo ufw allow 53/udp
-    sudo ufw allow 53/tcp
-    sudo ufw reload
-    ```
-
-    If you used a custom port (e.g., 5353), adjust the commands accordingly:
-
-    ```bash
-    sudo ufw allow 5353/udp
-    sudo ufw allow 5353/tcp
-    sudo ufw reload
-    ```
-
-*   **Configure Client Devices:**
-
-    To use your new recursive DNS server, configure your client devices (computers, routers, etc.) to use your Ubuntu server's IP address as their primary DNS resolver.
-
-## Build Instructions (For Development)
-
-For local development or manual building, navigate to the project root directory and run:
+### Автоматическая установка (рекомендуется)
 
 ```bash
-/usr/local/go/bin/go build -o dns-server
+# Быстрая установка с автоматической настройкой сервиса
+curl -sSL https://raw.githubusercontent.com/ASTRACAT2022/dns-g/main/install.sh | sudo bash
+
+# Или клонировать и запустить локально
+git clone https://github.com/ASTRACAT2022/dns-g.git
+cd dns-g
+sudo ./install.sh
 ```
 
-This will create an executable file named `dns-server` in the current directory.
+Автоматический установщик:
+- ✅ Устанавливает все зависимости (включая Go)
+- ✅ Создает системный сервис (systemd/launchd)
+- ✅ Настраивает автозапуск
+- ✅ Конфигурирует файрвол
+- ✅ Создает команды управления
 
-## Running Tests
+После установки используйте:
+```bash
+dns-g-ctl start     # Запуск сервиса
+dns-g-ctl status    # Проверка статуса
+dns-g-ctl test      # Тестирование DNS
+```
 
-To run the automated tests (requires Go installed locally):
+### Ручная установка
 
 ```bash
-/usr/local/go/bin/go test -v
+# Клонирование репозитория
+git clone https://github.com/ASTRACAT2022/dns-g.git
+cd dns-g
+
+# Установка зависимостей
+go mod tidy
+
+# Сборка
+go build -o dns_resolver main.go
+
+# Запуск
+./dns_resolver
 ```
+
+Сервер запустится на порту **5454** (изменен с 5353 для избежания конфликта с системным mDNS).
+
+## Использование
+
+### Тестирование с помощью dig
+
+```bash
+# A записи
+dig @localhost -p 5454 google.com A +short
+
+# AAAA записи
+dig @localhost -p 5454 ipv6.google.com AAAA +short
+
+# MX записи
+dig @localhost -p 5454 gmail.com MX +short
+
+# TXT записи
+dig @localhost -p 5454 example.com TXT +short
+
+# CNAME записи
+dig @localhost -p 5454 www.example.com CNAME +short
+```
+
+### Автоматическое тестирование
+
+Запустите тестовый скрипт для комплексной проверки:
+
+```bash
+./test_dns_resolver.sh
+```
+
+### Юнит-тесты
+
+```bash
+go test -v
+```
+
+## Производительность
+
+Результаты тестирования показывают отличную производительность:
+
+- **Первый запрос**: ~300-900ms (время разрешения через интернет)
+- **Кэшированный запрос**: ~40-100µs (в тысячи раз быстрее!)
+
+### Пример результатов тестирования
+
+```
+Testing example.com A record...
+  example.com A - First query: OK (Time: .910319000 seconds)
+  example.com A - Second query: OK (Time: .007494000 seconds)
+
+Testing ipv6.google.com AAAA record...
+  ipv6.google.com AAAA - First query: OK (Time: .730056000 seconds)
+  ipv6.google.com AAAA - Second query: OK (Time: .008414000 seconds)
+```
+
+## Архитектура
+
+### Основные компоненты
+
+1. **UDP Сервер**: Слушает на порту 5454, обрабатывает DNS запросы
+2. **dnsr.Resolver**: Библиотека для разрешения DNS запросов с собственным кэшем
+3. **Кэш приложения**: Дополнительный уровень кэширования с настраиваемым TTL
+4. **Конкурентная обработка**: Каждый запрос обрабатывается в отдельной горутине
+
+### Конфигурация
+
+```go
+const (
+    listenPort = 5454               // Порт для прослушивания
+    cacheTTL   = 5 * time.Minute    // TTL кэша приложения
+)
+
+// Настройки dnsr.Resolver
+resolver = dnsr.NewResolver(
+    dnsr.WithCache(10000),            // Кэш на 10000 записей
+    dnsr.WithTimeout(10*time.Second), // Таймаут 10 секунд
+    dnsr.WithExpiry(),                // Очистка устаревших записей
+    dnsr.WithTCPRetry(),              // Повтор по TCP при усечении
+)
+```
+
+## Поддерживаемые типы записей
+
+| Тип | Описание | Поддержка |
+|-----|----------|-----------|
+| A | IPv4 адреса | ✅ |
+| AAAA | IPv6 адреса | ✅ |
+| CNAME | Канонические имена | ✅ |
+| MX | Mail exchange | ✅ |
+| NS | Name servers | ✅ |
+| TXT | Текстовые записи | ✅ |
+| SOA | Start of authority | ⏭️ (пропускается) |
+
+## Мониторинг
+
+Сервер предоставляет детальное логирование:
+
+- Время обработки каждого запроса
+- Статистика попаданий/промахов кэша
+- Ошибки разрешения DNS
+- Информация о клиентах
+
+### Пример логов
+
+```
+2025/08/21 13:36:16 Cache miss for example.com._1 from [::1]:50366
+2025/08/21 13:36:17 Resolved example.com. A: 8 records
+2025/08/21 13:36:17 Request from [::1]:50366 processed in 891.967167ms
+2025/08/21 13:36:17 Cache hit for example.com._1 from [::1]:51216
+2025/08/21 13:36:17 Request from [::1]:51216 processed in 65.25µs
+```
+
+## Файлы проекта
+
+- `main.go` - Основной код DNS сервера
+- `main_test.go` - Юнит-тесты
+- `test_dns_resolver.sh` - Скрипт для интеграционного тестирования
+- `go.mod` / `go.sum` - Управление зависимостями Go
+- `README.md` - Документация
+
+## Зависимости
+
+- [github.com/domainr/dnsr](https://github.com/domainr/dnsr) - DNS resolver библиотека
+- [github.com/miekg/dns](https://github.com/miekg/dns) - DNS протокол для Go
+
+## Лицензия
+
+Проект распространяется под лицензией MIT.
+
+## Автор
+
+Создано как высокопроизводительная альтернатива PowerDNS с использованием современных технологий Go.
