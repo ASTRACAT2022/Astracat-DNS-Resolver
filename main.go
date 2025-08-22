@@ -17,7 +17,6 @@ const (
     listenPort = 5454
     cacheTTL   = 5 * time.Minute
     maxConcurrentRequests = 100 // Лимит одновременных запросов
-    maxRecursionDepth     = 5   // Максимальная глубина рекурсии для предотвращения зацикливания
 )
 
 // CacheEntry представляет запись в кэше
@@ -192,15 +191,15 @@ func handleRequest(ctx context.Context, conn *net.UDPConn, remoteAddr *net.UDPAd
 func resolveQuestion(ctx context.Context, q dns.Question) ([]dns.RR, error) {
     var answers []dns.RR
 
-    // Проверка глубины рекурсии
-    if q.Depth > maxRecursionDepth {
-        return nil, fmt.Errorf("превышена максимальная глубина рекурсии (%d)", maxRecursionDepth)
-    }
-
     // Преобразуем тип запроса в строку для dnsr
     qtype := dns.TypeToString[q.Qtype]
     if qtype == "" {
         return nil, fmt.Errorf("unsupported query type %d for %s", q.Qtype, q.Name)
+    }
+
+    // Проверка на циклические запросы
+    if isRecursiveLoop(q.Name) {
+        return nil, fmt.Errorf("обнаружен циклический запрос для домена %s", q.Name)
     }
 
     // Используем Resolver для разрешения запроса
@@ -210,11 +209,6 @@ func resolveQuestion(ctx context.Context, q dns.Question) ([]dns.RR, error) {
             return nil, fmt.Errorf("domain %s does not exist: %w", q.Name, err)
         }
         return nil, fmt.Errorf("failed to resolve %s %s: %w", q.Name, qtype, err)
-    }
-
-    // Добавляем проверку на циклические запросы
-    if isRecursiveLoop(q.Name) {
-        return nil, fmt.Errorf("обнаружен циклический запрос для домена %s", q.Name)
     }
 
     // Преобразуем dnsr.RRs в dns.RR
@@ -253,12 +247,12 @@ func resolveQuestion(ctx context.Context, q dns.Question) ([]dns.RR, error) {
         case "NS":
             answers = append(answers, &dns.NS{
                 Hdr: hdr,
-                Ns:  dns.Fqhn(rr.Value),
+                Ns:  dns.Fqdn(rr.Value),
             })
         case "CNAME":
             answers = append(answers, &dns.CNAME{
                 Hdr:    hdr,
-                Target: dns.Fqhn(rr.Value),
+                Target: dns.Fqdn(rr.Value),
             })
         case "TXT":
             answers = append(answers, &dns.TXT{
