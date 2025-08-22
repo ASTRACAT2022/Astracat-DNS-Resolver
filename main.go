@@ -14,45 +14,69 @@ import (
 )
 
 const (
-    listenPort = 5454
-    cacheTTL   = 5 * time.Minute
-    maxConcurrentRequests = 100 // Лимит одновременных запросов
+    listenPort               = 5454
+    maxConcurrentRequests    = 100
+    cacheCleanupInterval     = 1 * time.Minute
+    defaultCacheExpiration   = 5 * time.Minute
+    minimumAllowedTTL        = 1 * time.Second
 )
 
-// CacheEntry представляет запись в кэше
 type cacheEntry struct {
     response []byte
     expiry   time.Time
 }
 
 var (
-    semaphore = make(chan struct{}, maxConcurrentRequests) // Семафор для ограничения параллелизма
-    cache       = make(map[string]cacheEntry)
-    cacheHits   int
-    cacheMisses int
-    cacheMutex  sync.RWMutex
-    resolver    *dnsr.Resolver
+    semaphore          = make(chan struct{}, maxConcurrentRequests)
+    cache              = make(map[string]cacheEntry)
+    cacheHits          int
+    cacheMisses        int
+    cacheMutex         sync.RWMutex
+    resolver           *dnsr.Resolver
+    cleanupTicker      *time.Ticker
+    stopCleanupChannel chan struct{}
 )
 
 func init() {
-    // Инициализируем Resolver из пакета dnsr
     resolver = dnsr.NewResolver(
-        dnsr.WithCache(10000),            // Кэш на 10000 записей
-        dnsr.WithTimeout(10*time.Second), // Увеличенный таймаут 10 секунд
-        dnsr.WithExpiry(),                // Очистка устаревших записей по TTL
-        dnsr.WithTCPRetry(),              // Повтор по TCP при усечении
+        dnsr.WithCache(10000),
+        dnsr.WithTimeout(10*time.Second),
+        dnsr.WithExpiry(),
+        dnsr.WithTCPRetry(),
     )
+
+    stopCleanupChannel = make(chan struct{})
+    cleanupTicker = time.NewTicker(cacheCleanupInterval)
+    go cleanupCache()
+}
+
+func cleanupCache() {
+    for {
+        select {
+        case <-cleanupTicker.C:
+            now := time.Now()
+            cacheMutex.Lock()
+            for key, entry := range cache {
+                if now.After(entry.expiry) {
+                    delete(cache, key)
+                }
+            }
+            cacheMutex.Unlock()
+        case <-stopCleanupChannel:
+            return
+        }
+    }
 }
 
 func main() {
-    // Запускаем DNS-сервер на 127.0.0.1
-    addr := "127.0.0.1:" + fmt.Sprintf("%d", listenPort)
-    
+    defer cleanupTicker.Stop()
+    defer close(stopCleanupChannel)
+
+    addr := fmt.Sprintf("127.0.0.1:%d", listenPort)
     udpAddr, err := net.ResolveUDPAddr("udp", addr)
     if err != nil {
         log.Fatalf("Ошибка при разрешении UDP-адреса: %v", err)
     }
-
     conn, err := net.ListenUDP("udp", udpAddr)
     if err != nil {
         log.Fatalf("Ошибка при запуске UDP-сервера: %v", err)
@@ -60,9 +84,8 @@ func main() {
     defer conn.Close()
 
     log.Printf("DNS-резолвер запущен на UDP-адресе %s", addr)
-
     buffer := make([]byte, 1024)
-    
+
     for {
         n, remoteAddr, err := conn.ReadFromUDP(buffer)
         if err != nil {
@@ -74,19 +97,16 @@ func main() {
         copy(requestCopy, buffer[:n])
 
         go func() {
-            semaphore <- struct{}{} // Блокировка семафора
-            defer func() { 
-                <-semaphore // Освобождение семафора
+            semaphore <- struct{}{}
+            defer func() {
+                <-semaphore
                 if r := recover(); r != nil {
                     log.Printf("Паника в горутине: %v\n%s", r, debug.Stack())
                 }
-            }() // Обработка паники
-            
-            // Контекст с таймаутом 5 секунд
+            }()
+
             ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
             defer cancel()
-            
-            // Обработка запроса в отдельной горутине
             handleRequest(ctx, conn, remoteAddr, requestCopy)
         }()
     }
@@ -94,33 +114,29 @@ func main() {
 
 func handleRequest(ctx context.Context, conn *net.UDPConn, remoteAddr *net.UDPAddr, request []byte) {
     startTime := time.Now()
-    
     msg := new(dns.Msg)
     if err := msg.Unpack(request); err != nil {
-        log.Printf("Error unpacking DNS request from %s: %v", remoteAddr.String(), err)
+        log.Printf("Ошибка распаковки DNS-запроса от %s: %v", remoteAddr.String(), err)
         sendErrorResponse(conn, remoteAddr, msg, dns.RcodeServerFailure)
         return
     }
 
     defer func() {
         duration := time.Since(startTime)
-        log.Printf("Request from %s processed in %v", remoteAddr.String(), duration)
+        log.Printf("Запрос от %s обработан за %v", remoteAddr.String(), duration)
     }()
 
-    // Формируем ключ кэша
     cacheKey := ""
     if len(msg.Question) > 0 {
         q := msg.Question[0]
         cacheKey = fmt.Sprintf("%s_%d", q.Name, q.Qtype)
     }
 
-    // Проверяем кэш приложения
     if cacheKey != "" {
         cacheMutex.RLock()
         if entry, found := cache[cacheKey]; found && time.Now().Before(entry.expiry) {
             cacheMutex.RUnlock()
             cacheHits++
-            // Обновляем ID для кэшированного ответа
             cachedMsg := new(dns.Msg)
             if err := cachedMsg.Unpack(entry.response); err == nil {
                 cachedMsg.Id = msg.Id
@@ -128,173 +144,158 @@ func handleRequest(ctx context.Context, conn *net.UDPConn, remoteAddr *net.UDPAd
                 if err == nil {
                     _, err = conn.WriteToUDP(responseBytes, remoteAddr)
                     if err != nil {
-                        log.Printf("Error sending cached response to %s: %v", remoteAddr.String(), err)
+                        log.Printf("Ошибка отправки кэшированного ответа на %s: %v", remoteAddr.String(), err)
                     }
-                    log.Printf("Cache hit for %s from %s", cacheKey, remoteAddr.String())
+                    log.Printf("Успешное попадание в кэш для %s от %s", cacheKey, remoteAddr.String())
                     return
                 }
             }
         }
         cacheMutex.RUnlock()
         cacheMisses++
-        log.Printf("Cache miss for %s from %s", cacheKey, remoteAddr.String())
+        log.Printf("Промах кэша для %s от %s", cacheKey, remoteAddr.String())
     }
 
-    // Создаём ответ
     responseMsg := new(dns.Msg)
     responseMsg.SetReply(msg)
     responseMsg.Compress = false
-    responseMsg.Id = msg.Id // Устанавливаем правильный ID
+    responseMsg.Id = msg.Id
 
-    // Обрабатываем вопросы с помощью dnsr.Resolver
+    var allAnswers []dns.RR
     for _, q := range msg.Question {
         answers, err := resolveQuestion(ctx, q)
         if err != nil {
-            log.Printf("Error resolving DNS question for %s from %s: %v", q.Name, remoteAddr.String(), err)
+            log.Printf("Ошибка разрешения DNS-вопроса для %s от %s: %v", q.Name, remoteAddr.String(), err)
             responseMsg.SetRcode(msg, dns.RcodeNameError)
             continue
         }
-        responseMsg.Answer = append(responseMsg.Answer, answers...)
+        allAnswers = append(allAnswers, answers...)
     }
 
-    // Упаковываем ответ
+    responseMsg.Answer = allAnswers
+
     responseBytes, err := responseMsg.Pack()
     if err != nil {
-        log.Printf("Error packing DNS response for %s from %s: %v", cacheKey, remoteAddr.String(), err)
+        log.Printf("Ошибка упаковки DNS-ответа для %s от %s: %v", cacheKey, remoteAddr.String(), err)
         sendErrorResponse(conn, remoteAddr, msg, dns.RcodeServerFailure)
         return
     }
 
-    // Сохраняем в кэш приложения, если есть ответы
-    if cacheKey != "" && len(responseMsg.Answer) > 0 {
+    if cacheKey != "" && len(allAnswers) > 0 {
+        ttl := calculateMinTTL(allAnswers)
+        if ttl <= minimumAllowedTTL {
+            ttl = defaultCacheExpiration
+        }
         cacheMutex.Lock()
         cache[cacheKey] = cacheEntry{
             response: responseBytes,
-            expiry:   time.Now().Add(cacheTTL),
+            expiry:   time.Now().Add(ttl),
         }
         cacheMutex.Unlock()
     }
 
-    // Отправляем ответ клиенту
     select {
     case <-ctx.Done():
-        log.Printf("Запрос прерван из-за таймаута: %v", ctx.Err())
+        log.Printf("Запрос отменен из-за истечения таймаута: %v", ctx.Err())
         return
     default:
         _, err = conn.WriteToUDP(responseBytes, remoteAddr)
         if err != nil {
-            log.Printf("Error sending response to %s: %v", remoteAddr.String(), err)
+            log.Printf("Ошибка отправки ответа на %s: %v", remoteAddr.String(), err)
         }
     }
+}
+
+func calculateMinTTL(answers []dns.RR) time.Duration {
+    minTtl := time.Hour
+    for _, answer := range answers {
+        currentTtl := time.Duration(answer.Header().Ttl) * time.Second
+        if currentTtl < minTtl {
+            minTtl = currentTtl
+        }
+    }
+    return minTtl
 }
 
 func resolveQuestion(ctx context.Context, q dns.Question) ([]dns.RR, error) {
     var answers []dns.RR
 
-    // Преобразуем тип запроса в строку для dnsr
     qtype := dns.TypeToString[q.Qtype]
     if qtype == "" {
-        return nil, fmt.Errorf("unsupported query type %d for %s", q.Qtype, q.Name)
+        return nil, fmt.Errorf("неподдерживаемый тип запроса %d для %s", q.Qtype, q.Name)
     }
 
-    // Проверка на циклические запросы
     if isRecursiveLoop(q.Name) {
-        return nil, fmt.Errorf("обнаружен циклический запрос для домена %s", q.Name)
+        return nil, fmt.Errorf("обнаружено рекурсивное обращение для домена %s", q.Name)
     }
 
-    // Используем Resolver для разрешения запроса
     rrs, err := resolver.ResolveErr(q.Name, qtype)
     if err != nil {
         if err == dnsr.NXDOMAIN {
-            return nil, fmt.Errorf("domain %s does not exist: %w", q.Name, err)
+            return nil, fmt.Errorf("домен %s не найден: %w", q.Name, err)
         }
-        return nil, fmt.Errorf("failed to resolve %s %s: %w", q.Name, qtype, err)
+        return nil, fmt.Errorf("ошибка разрешения %s %s: %w", q.Name, qtype, err)
     }
 
-    // Преобразуем dnsr.RRs в dns.RR
     for _, rr := range rrs {
-        hdr := dns.RR_Header{Name: dns.Fqdn(rr.Name), Rrtype: dns.StringToType[rr.Type], Class: dns.ClassINET, Ttl: uint32(rr.TTL / time.Second)}
+        hdr := dns.RR_Header{
+            Name:   dns.Fqdn(rr.Name),
+            Rrtype: dns.StringToType[rr.Type],
+            Class:  dns.ClassINET,
+            Ttl:    uint32(rr.TTL / time.Second),
+        }
+
         switch rr.Type {
         case "A":
             ip := net.ParseIP(rr.Value)
             if ip == nil || ip.To4() == nil {
                 continue
             }
-            answers = append(answers, &dns.A{
-                Hdr: hdr,
-                A:   ip.To4(),
-            })
+            answers = append(answers, &dns.A{Hdr: hdr, A: ip.To4()})
         case "AAAA":
             ip := net.ParseIP(rr.Value)
-            if ip == nil {
-                log.Printf("Invalid AAAA record for %s: %s", q.Name, rr.Value)
+            if ip == nil || ip.To16() == nil || ip.To4() != nil {
+                log.Printf("Недопустимая запись AAAA для %s: %s", q.Name, rr.Value)
                 continue
             }
-            if ip.To16() == nil || ip.To4() != nil {
-                log.Printf("Invalid AAAA record for %s: %s", q.Name, rr.Value)
-                continue
-            }
-            answers = append(answers, &dns.AAAA{
-                Hdr:  hdr,
-                AAAA: ip,
-            })
+            answers = append(answers, &dns.AAAA{Hdr: hdr, AAAA: ip})
         case "MX":
-            answers = append(answers, &dns.MX{
-                Hdr:        hdr,
-                Preference: 10, // Значение по умолчанию
-                Mx:         dns.Fqdn(rr.Value),
-            })
+            answers = append(answers, &dns.MX{Hdr: hdr, Preference: 10, Mx: dns.Fqdn(rr.Value)})
         case "NS":
-            answers = append(answers, &dns.NS{
-                Hdr: hdr,
-                Ns:  dns.Fqdn(rr.Value),
-            })
+            answers = append(answers, &dns.NS{Hdr: hdr, Ns: dns.Fqdn(rr.Value)})
         case "CNAME":
-            answers = append(answers, &dns.CNAME{
-                Hdr:    hdr,
-                Target: dns.Fqdn(rr.Value),
-            })
+            answers = append(answers, &dns.CNAME{Hdr: hdr, Target: dns.Fqdn(rr.Value)})
         case "TXT":
-            answers = append(answers, &dns.TXT{
-                Hdr: hdr,
-                Txt: []string{rr.Value},
-            })
+            answers = append(answers, &dns.TXT{Hdr: hdr, Txt: []string{rr.Value}})
         case "SOA":
             continue
         default:
-            log.Printf("Unsupported record type: %s for %s", rr.Type, rr.Name)
+            log.Printf("Неподдерживаемый тип записи: %s для %s", rr.Type, rr.Name)
             continue
         }
     }
 
-    log.Printf("Resolved %s %s: %d records", q.Name, qtype, len(answers))
+    log.Printf("Разрешено %s %s: %d записей", q.Name, qtype, len(answers))
 
-    // Возвращаем ошибку, если не найдено записей для несуществующих доменов
     if len(answers) == 0 && len(rrs) == 0 {
-        return nil, fmt.Errorf("no records found for %s %s", q.Name, qtype)
+        return nil, fmt.Errorf("нет записей для %s %s", q.Name, qtype)
     }
 
     return answers, nil
 }
 
-// Проверка на циклические запросы (например, когда имя указывает на себя)
 func isRecursiveLoop(domain string) bool {
-    // Пример простой проверки - можно расширить
     if domain == "example.com" && net.ParseIP(domain) != nil {
         return true
     }
     return false
 }
 
-func printCacheStats() {
-    log.Printf("Cache hits: %d, cache misses: %d", cacheHits, cacheMisses)
-}
-
 func sendErrorResponse(conn *net.UDPConn, remoteAddr *net.UDPAddr, msg *dns.Msg, rcode int) {
     responseMsg := new(dns.Msg)
     responseMsg.SetRcode(msg, rcode)
     responseMsg.Compress = false
-    responseMsg.Id = msg.Id // Устанавливаем правильный ID
+    responseMsg.Id = msg.Id
     responseBytes, err := responseMsg.Pack()
     if err != nil {
         log.Printf("Ошибка упаковки ответа об ошибке: %v", err)
@@ -305,4 +306,8 @@ func sendErrorResponse(conn *net.UDPConn, remoteAddr *net.UDPAddr, msg *dns.Msg,
         log.Printf("Ошибка отправки ответа об ошибке по UDP: %v", err)
     }
     printCacheStats()
+}
+
+func printCacheStats() {
+    log.Printf("Попадания в кэш: %d, промахи кэша: %d", cacheHits, cacheMisses)
 }
