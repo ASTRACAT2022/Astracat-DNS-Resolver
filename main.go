@@ -14,9 +14,8 @@ import (
 
 type DNSServer struct {
 	resolver *dnsr.Resolver
-	// Используем visited map для защиты от циклов.
-	visited map[string]time.Time
-	mu      sync.RWMutex
+	visited  map[string]time.Time
+	mu       sync.RWMutex
 }
 
 func NewDNSServer() *DNSServer {
@@ -26,7 +25,6 @@ func NewDNSServer() *DNSServer {
 	}
 }
 
-// Запускает горутину, которая периодически очищает старые записи из мапы
 func (s *DNSServer) startCleaner() {
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
@@ -34,7 +32,6 @@ func (s *DNSServer) startCleaner() {
 		s.mu.Lock()
 		count := 0
 		for key, ts := range s.visited {
-			// Удаляем записи старше 10 минут, чтобы предотвратить бесконечный рост мапы
 			if time.Since(ts) > 10*time.Minute {
 				delete(s.visited, key)
 				count++
@@ -45,8 +42,6 @@ func (s *DNSServer) startCleaner() {
 	}
 }
 
-// handleRequestWrapper запускает обработку запроса в отдельной горутине
-// с защитой от паники
 func (s *DNSServer) handleRequestWrapper(w dns.ResponseWriter, req *dns.Msg) {
 	go func() {
 		defer func() {
@@ -61,9 +56,6 @@ func (s *DNSServer) handleRequestWrapper(w dns.ResponseWriter, req *dns.Msg) {
 }
 
 func (s *DNSServer) handleRequest(w dns.ResponseWriter, req *dns.Msg) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
 	if len(req.Question) == 0 {
 		s.sendErrorResponse(w, req, dns.RcodeFormatError, "No questions in request")
 		return
@@ -72,7 +64,6 @@ func (s *DNSServer) handleRequest(w dns.ResponseWriter, req *dns.Msg) {
 	question := req.Question[0]
 	queryKey := fmt.Sprintf("%s:%d", question.Name, question.Qtype)
 
-	// Защита от циклов: если запрос уже был недавно
 	s.mu.RLock()
 	_, exists := s.visited[queryKey]
 	s.mu.RUnlock()
@@ -82,7 +73,6 @@ func (s *DNSServer) handleRequest(w dns.ResponseWriter, req *dns.Msg) {
 		return
 	}
 
-	// Записываем время запроса
 	s.mu.Lock()
 	s.visited[queryKey] = time.Now()
 	if len(s.visited) > 100000 {
@@ -107,27 +97,39 @@ func (s *DNSServer) handleRequest(w dns.ResponseWriter, req *dns.Msg) {
 		s.sendErrorResponse(w, req, dns.RcodeNotImplemented, "Unsupported QTYPE")
 		return
 	}
+	
+	// Здесь мы используем контекст для контроля таймаута
+	resultsChan := make(chan []*dnsr.Result, 1)
+	go func() {
+		resultsChan <- s.resolver.Resolve(question.Name, qtypeStr)
+	}()
 
-	results := s.resolver.Resolve(question.Name, qtypeStr)
-	var hasValidAnswer bool
-
-	for _, res := range results {
-		rrStr := res.String()
-		rr, err := dns.NewRR(rrStr)
-		if err != nil {
-			fmt.Printf("Failed to parse RR '%s': %v\n", rrStr, err)
-			continue
+	select {
+	case results := <-resultsChan:
+		// Успешно получили ответ до таймаута
+		var hasValidAnswer bool
+		for _, res := range results {
+			rrStr := res.String()
+			rr, err := dns.NewRR(rrStr)
+			if err != nil {
+				fmt.Printf("Failed to parse RR '%s': %v\n", rrStr, err)
+				continue
+			}
+			reply.Answer = append(reply.Answer, rr)
+			hasValidAnswer = true
 		}
-		reply.Answer = append(reply.Answer, rr)
-		hasValidAnswer = true
-	}
 
-	if !hasValidAnswer {
-		reply.SetRcode(req, dns.RcodeNameError)
-	}
+		if !hasValidAnswer {
+			reply.SetRcode(req, dns.RcodeNameError)
+		}
 
-	if err := w.WriteMsg(reply); err != nil {
-		fmt.Printf("Error writing response: %v\n", err)
+		if err := w.WriteMsg(reply); err != nil {
+			fmt.Printf("Error writing response: %v\n", err)
+		}
+	case <-time.After(5 * time.Second):
+		// Таймаут истек
+		s.sendErrorResponse(w, req, dns.RcodeServerFailure, "Query timeout")
+		return
 	}
 }
 
@@ -136,6 +138,7 @@ func (s *DNSServer) sendErrorResponse(w dns.ResponseWriter, req *dns.Msg, rcode 
 	if req != nil && len(req.Question) > 0 {
 		reply.SetReply(req)
 	} else {
+		// Создаем пустой ответ, если запрос некорректен
 		reply.SetRcode(req, rcode)
 	}
 
