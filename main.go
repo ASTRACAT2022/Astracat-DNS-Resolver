@@ -13,21 +13,20 @@ import (
 )
 
 type DNSServer struct {
-	resolver       *dnsr.Resolver
-	visited        map[string]time.Time
-	mu             sync.RWMutex
-	nxdomainCounter map[string]int 
+	resolver        *dnsr.Resolver
+	visited         map[string]time.Time
+	mu              sync.RWMutex
+	nxdomainCounter map[string]int
 }
 
 const (
-	nxdomainLimit = 3 
+	nxdomainLimit = 3
 )
 
 func NewDNSServer() *DNSServer {
 	return &DNSServer{
-		// Используем WithNoCache() для отключения всего кэширования
-		resolver:       dnsr.NewResolver(dnsr.WithNoCache()),
-		visited:        make(map[string]time.Time),
+		resolver:        dnsr.NewResolver(dnsr.WithCache(100000), dnsr.WithExpiry()),
+		visited:         make(map[string]time.Time),
 		nxdomainCounter: make(map[string]int),
 	}
 }
@@ -122,6 +121,9 @@ func (s *DNSServer) handleRequest(w dns.ResponseWriter, req *dns.Msg) {
 			go restartServer()
 		}
 		s.mu.Unlock()
+
+		// Удаляем NXDOMAIN из кэша вручную
+		s.resolver.Evict(question.Name, question.Qtype)
 
 		reply.SetRcode(req, dns.RcodeNameError)
 		if err := w.WriteMsg(reply); err != nil {
