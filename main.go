@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"net"
-	"runtime/debug"
 	"sync"
 	"time"
 
@@ -39,19 +38,6 @@ func (s *DNSServer) startCleaner() {
 		s.mu.Unlock()
 		fmt.Printf("Cleaned %d old entries from visited map.\n", count)
 	}
-}
-
-func (s *DNSServer) handleRequestWrapper(w dns.ResponseWriter, req *dns.Msg) {
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				fmt.Printf("Recovered from panic during request handling: %v\n", r)
-				debug.PrintStack()
-				s.sendErrorResponse(w, req, dns.RcodeServerFailure, "Internal server error")
-			}
-		}()
-		s.handleRequest(w, req)
-	}()
 }
 
 func (s *DNSServer) handleRequest(w dns.ResponseWriter, req *dns.Msg) {
@@ -97,35 +83,27 @@ func (s *DNSServer) handleRequest(w dns.ResponseWriter, req *dns.Msg) {
 		return
 	}
 
-	resultsChan := make(chan []*dnsr.Result, 1)
-	go func() {
-		resultsChan <- s.resolver.Resolve(question.Name, qtypeStr)
-	}()
+	// Вызываем резолвер и обрабатываем результат
+	results := s.resolver.Resolve(question.Name, qtypeStr)
+	var hasValidAnswer bool
 
-	select {
-	case results := <-resultsChan:
-		var hasValidAnswer bool
-		for _, res := range results {
-			rrStr := res.String()
-			rr, err := dns.NewRR(rrStr)
-			if err != nil {
-				fmt.Printf("Failed to parse RR '%s': %v\n", rrStr, err)
-				continue
-			}
-			reply.Answer = append(reply.Answer, rr)
-			hasValidAnswer = true
+	for _, res := range results {
+		rrStr := res.String()
+		rr, err := dns.NewRR(rrStr)
+		if err != nil {
+			fmt.Printf("Failed to parse RR '%s': %v\n", rrStr, err)
+			continue
 		}
+		reply.Answer = append(reply.Answer, rr)
+		hasValidAnswer = true
+	}
 
-		if !hasValidAnswer {
-			reply.SetRcode(req, dns.RcodeNameError)
-		}
+	if !hasValidAnswer {
+		reply.SetRcode(req, dns.RcodeNameError)
+	}
 
-		if err := w.WriteMsg(reply); err != nil {
-			fmt.Printf("Error writing response: %v\n", err)
-		}
-	case <-time.After(5 * time.Second):
-		s.sendErrorResponse(w, req, dns.RcodeServerFailure, "Query timeout")
-		return
+	if err := w.WriteMsg(reply); err != nil {
+		fmt.Printf("Error writing response: %v\n", err)
 	}
 }
 
@@ -154,7 +132,7 @@ func main() {
 	server := NewDNSServer()
 	go server.startCleaner()
 
-	dns.HandleFunc(".", server.handleRequestWrapper)
+	dns.HandleFunc(".", server.handleRequest)
 
 	udpServer := &dns.Server{Addr: ":5454", Net: "udp"}
 	go func() {
