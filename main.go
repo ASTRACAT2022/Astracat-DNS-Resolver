@@ -195,9 +195,7 @@ func runServer() {
 
 
 
-func main() {
-    runServer()
-}
+
 
 func startDNSServer(conn *net.UDPConn) {
     buffer := make([]byte, 1024)
