@@ -3,6 +3,8 @@ package main
 import (
 	"fmt"
 	"net"
+	"os"
+	"os/exec"
 	"sync"
 	"time"
 
@@ -11,25 +13,23 @@ import (
 )
 
 type DNSServer struct {
-	resolver     *dnsr.Resolver
-	visited      map[string]time.Time
-	mu           sync.RWMutex
-	privateZones map[string]string // Добавлена мапа для приватных зон
+	resolver       *dnsr.Resolver
+	visited        map[string]time.Time
+	mu             sync.RWMutex
+	nxdomainCounter map[string]int 
 }
+
+const (
+	nxdomainLimit = 3 
+)
 
 func NewDNSServer() *DNSServer {
 	return &DNSServer{
-		resolver:     dnsr.NewResolver(dnsr.WithCache(100000), dnsr.WithExpiry()),
-		visited:      make(map[string]time.Time),
-		privateZones: make(map[string]string),
+		// Используем WithNoCache() для отключения всего кэширования
+		resolver:       dnsr.NewResolver(dnsr.WithNoCache()),
+		visited:        make(map[string]time.Time),
+		nxdomainCounter: make(map[string]int),
 	}
-}
-
-// AddPrivateZone добавляет статическую запись в приватную зону
-func (s *DNSServer) AddPrivateZone(domain, ip string) {
-	s.mu.Lock()
-	s.privateZones[domain] = ip
-	s.mu.Unlock()
 }
 
 func (s *DNSServer) startCleaner() {
@@ -47,6 +47,15 @@ func (s *DNSServer) startCleaner() {
 		s.mu.Unlock()
 		fmt.Printf("Cleaned %d old entries from visited map.\n", count)
 	}
+}
+
+func restartServer() {
+	fmt.Println("NXDOMAIN limit reached. Restarting server...")
+	cmd := exec.Command(os.Args[0], os.Args[1:]...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Run()
+	os.Exit(0)
 }
 
 func (s *DNSServer) handleRequest(w dns.ResponseWriter, req *dns.Msg) {
@@ -92,37 +101,9 @@ func (s *DNSServer) handleRequest(w dns.ResponseWriter, req *dns.Msg) {
 		return
 	}
 
-	// 1. Проверяем приватные зоны
-	s.mu.RLock()
-	ip, isPrivate := s.privateZones[question.Name]
-	s.mu.RUnlock()
-
-	if isPrivate {
-		rr, err := dns.NewRR(fmt.Sprintf("%s %s A %s", question.Name, "60s", ip))
-		if err != nil {
-			s.sendErrorResponse(w, req, dns.RcodeServerFailure, "Failed to parse private zone record")
-			return
-		}
-		reply.Answer = append(reply.Answer, rr)
-		if err := w.WriteMsg(reply); err != nil {
-			fmt.Printf("Error writing response: %v\n", err)
-		}
-		return
-	}
-
-	// 2. Выполняем рекурсивный запрос
 	results := s.resolver.Resolve(question.Name, qtypeStr)
+	var hasValidAnswer bool
 
-	if len(results) == 0 {
-		// Если результатов нет, отправляем NXDOMAIN
-		reply.SetRcode(req, dns.RcodeNameError)
-		if err := w.WriteMsg(reply); err != nil {
-			fmt.Printf("Error writing response: %v\n", err)
-		}
-		return
-	}
-
-	// 3. Обрабатываем результаты
 	for _, res := range results {
 		rrStr := res.String()
 		rr, err := dns.NewRR(rrStr)
@@ -131,7 +112,27 @@ func (s *DNSServer) handleRequest(w dns.ResponseWriter, req *dns.Msg) {
 			continue
 		}
 		reply.Answer = append(reply.Answer, rr)
+		hasValidAnswer = true
 	}
+
+	if !hasValidAnswer {
+		s.mu.Lock()
+		s.nxdomainCounter[question.Name]++
+		if s.nxdomainCounter[question.Name] >= nxdomainLimit {
+			go restartServer()
+		}
+		s.mu.Unlock()
+
+		reply.SetRcode(req, dns.RcodeNameError)
+		if err := w.WriteMsg(reply); err != nil {
+			fmt.Printf("Error writing response: %v\n", err)
+		}
+		return
+	}
+
+	s.mu.Lock()
+	delete(s.nxdomainCounter, question.Name)
+	s.mu.Unlock()
 
 	if err := w.WriteMsg(reply); err != nil {
 		fmt.Printf("Error writing response: %v\n", err)
@@ -161,8 +162,6 @@ func (s *DNSServer) sendErrorResponse(w dns.ResponseWriter, req *dns.Msg, rcode 
 
 func main() {
 	server := NewDNSServer()
-	// Добавляем статические записи для тестирования
-	server.AddPrivateZone("my.local.domain.", "10.0.0.100")
 	go server.startCleaner()
 
 	dns.HandleFunc(".", server.handleRequest)
