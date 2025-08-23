@@ -115,7 +115,7 @@ func (s *DNSServer) handleRequest(w dns.ResponseWriter, msg *dns.Msg) {
 }
 
 func (s *DNSServer) sendErrorResponse(w dns.ResponseWriter, msg *dns.Msg, rcode int) {
-	reply := newល
+	reply := new(dns.Msg) // Исправлено: использование new(dns.Msg) вместо newល
 	reply.SetReply(msg)
 	reply.Compress = true
 	reply.SetRcode(msg, rcode)
