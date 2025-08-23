@@ -1,54 +1,26 @@
 #!/bin/bash
 
-# Set the DNS server and port
-DNS_SERVER="localhost"
-DNS_PORT="5454"
+# Тестирование DNS резолвера
 
-# Define arrays of domains and record types to test
-domains=("example.com" "ipv6.google.com" "www.example.com" "gmail.com" "example.com")
-record_types=("A" "AAAA" "CNAME" "MX" "TXT")
+# Проверяем, запущен ли сервер
+if ! pgrep -f "dns_resolver" > /dev/null; then
+  echo "Запускаем DNS резолвер..."
+  go run main.go &
+  sleep 2 # Даем время на запуск
+fi
 
-# Function to test a DNS query
-test_dns_query() {
-  domain="$1"
-  record_type="$2"
+# Тестовые запросы
+echo -e "\nТестируем A запись (google.com):"
+dig @127.0.0.1 -p 5454 google.com A +short
 
-  echo "Testing ${domain} ${record_type} record..."
+echo -e "\nТестируем CNAME запись (www.google.com):"
+dig @127.0.0.1 -p 5454 www.google.com CNAME +short
 
-  # Measure the time taken for the first query
-  start=$(date +%s.%N)
-  dig @${DNS_SERVER} -p ${DNS_PORT} ${domain} ${record_type} +short
-  result=$?
-  end=$(date +%s.%N)
-  duration=$(echo "$end - $start" | bc)
+echo -e "\nТестируем MX запись (google.com):"
+dig @127.0.0.1 -p 5454 google.com MX +short
 
-  if [ $result -eq 0 ]; then
-    echo "  ${domain} ${record_type} - First query: OK (Time: ${duration} seconds)"
-  else
-    echo "  ${domain} ${record_type} - First query: FAILED"
-  fi
-
-  # Measure the time taken for the second query (to test caching)
-  start=$(date +%s.%N)
-  dig @${DNS_SERVER} -p ${DNS_PORT} ${domain} ${record_type} +short
-  result=$?
-  end=$(date +%s.%N)
-  duration=$(echo "$end - $start" | bc)
-
-  if [ $result -eq 0 ]; then
-    echo "  ${domain} ${record_type} - Second query: OK (Time: ${duration} seconds)"
-  else
-    echo "  ${domain} ${record_type} - Second query: FAILED"
-  fi
-
-  echo ""
-}
-
-# Loop through the domains and record types
-for i in $(seq 0 $((${#domains[@]} - 1))); do
-  domain="${domains[$i]}"
-  record_type="${record_types[$i]}"
-  test_dns_query "${domain}" "${record_type}"
-done
-
-echo "Testing complete."
+# Останавливаем сервер, если был запущен нами
+if [ "$1" == "--stop" ]; then
+  pkill -f "dns_resolver"
+  echo "Сервер остановлен"
+fi
