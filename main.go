@@ -1,141 +1,178 @@
 package main
 
 import (
-    "context"
-    "fmt"
-    "net"
-    "sync"
-    "time"
+	"context"
+	"fmt"
+	"net"
+	"runtime/debug"
+	"sync"
+	"time"
 
-    "github.com/domainr/dnsr"
-    "github.com/miekg/dns"
-    "golang.org/x/time/rate"
+	"github.com/domainr/dnsr"
+	"github.com/miekg/dns"
 )
 
 type DNSServer struct {
-    resolver    *dnsr.Resolver
-    rateLimiter *rate.Limiter
-    visited     map[string]struct{}
-    mu          sync.RWMutex
+	resolver *dnsr.Resolver
+	// Используем visited map для защиты от циклов.
+	visited map[string]time.Time
+	mu      sync.RWMutex
 }
 
 func NewDNSServer() *DNSServer {
-    return &DNSServer{
-        resolver:    dnsr.NewResolver(dnsr.WithCache(10000), dnsr.WithExpiry()),
-        rateLimiter: rate.NewLimiter(rate.Every(time.Second), 100),
-        visited:     make(map[string]struct{}),
-    }
+	return &DNSServer{
+		resolver: dnsr.NewResolver(dnsr.WithCache(100000), dnsr.WithExpiry()),
+		visited:  make(map[string]time.Time),
+	}
+}
+
+// Запускает горутину, которая периодически очищает старые записи из мапы
+func (s *DNSServer) startCleaner() {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+	for range ticker.C {
+		s.mu.Lock()
+		count := 0
+		for key, ts := range s.visited {
+			// Удаляем записи старше 10 минут, чтобы предотвратить бесконечный рост мапы
+			if time.Since(ts) > 10*time.Minute {
+				delete(s.visited, key)
+				count++
+			}
+		}
+		s.mu.Unlock()
+		fmt.Printf("Cleaned %d old entries from visited map.\n", count)
+	}
+}
+
+// handleRequestWrapper запускает обработку запроса в отдельной горутине
+// с защитой от паники
+func (s *DNSServer) handleRequestWrapper(w dns.ResponseWriter, req *dns.Msg) {
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				fmt.Printf("Recovered from panic during request handling: %v\n", r)
+				debug.PrintStack()
+				s.sendErrorResponse(w, req, dns.RcodeServerFailure, "Internal server error")
+			}
+		}()
+		s.handleRequest(w, req)
+	}()
 }
 
 func (s *DNSServer) handleRequest(w dns.ResponseWriter, req *dns.Msg) {
-    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-    defer cancel()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 
-    if err := s.rateLimiter.Wait(ctx); err != nil {
-        s.sendErrorResponse(w, req, dns.RcodeServerFailure, "Rate limit exceeded")
-        return
-    }
+	if len(req.Question) == 0 {
+		s.sendErrorResponse(w, req, dns.RcodeFormatError, "No questions in request")
+		return
+	}
 
-    if len(req.Question) == 0 {
-        s.sendErrorResponse(w, req, dns.RcodeFormatError, "No questions in request")
-        return
-    }
+	question := req.Question[0]
+	queryKey := fmt.Sprintf("%s:%d", question.Name, question.Qtype)
 
-    question := req.Question[0]
-    queryKey := fmt.Sprintf("%s:%d", question.Name, question.Qtype)
+	// Защита от циклов: если запрос уже был недавно
+	s.mu.RLock()
+	_, exists := s.visited[queryKey]
+	s.mu.RUnlock()
 
-    s.mu.RLock()
-    if _, exists := s.visited[queryKey]; exists {
-        s.mu.RUnlock()
-        s.sendErrorResponse(w, req, dns.RcodeRefused, "Potential loop detected")
-        return
-    }
-    s.mu.RUnlock()
+	if exists {
+		s.sendErrorResponse(w, req, dns.RcodeRefused, "Potential query loop detected")
+		return
+	}
 
-    s.mu.Lock()
-    s.visited[queryKey] = struct{}{}
-    s.mu.Unlock()
+	// Записываем время запроса
+	s.mu.Lock()
+	s.visited[queryKey] = time.Now()
+	if len(s.visited) > 100000 {
+		s.visited = make(map[string]time.Time)
+		fmt.Println("Visited map cleared due to reaching size limit.")
+	}
+	s.mu.Unlock()
 
-    defer func() {
-        s.mu.Lock()
-        delete(s.visited, queryKey)
-        s.mu.Unlock()
-    }()
+	defer func() {
+		s.mu.Lock()
+		delete(s.visited, queryKey)
+		s.mu.Unlock()
+	}()
 
-    if len(s.visited) >= 10000 {
-        s.mu.Lock()
-        s.visited = make(map[string]struct{})
-        s.mu.Unlock()
-    }
+	reply := new(dns.Msg)
+	reply.SetReply(req)
+	reply.Compress = true
+	reply.RecursionAvailable = true
 
-    reply := new(dns.Msg)
-    reply.SetReply(req)
-    reply.Compress = true
-    reply.RecursionAvailable = true
+	qtypeStr, ok := dns.TypeToString[question.Qtype]
+	if !ok {
+		s.sendErrorResponse(w, req, dns.RcodeNotImplemented, "Unsupported QTYPE")
+		return
+	}
 
-    qtypeStr, ok := dns.TypeToString[question.Qtype]
-    if !ok {
-        s.sendErrorResponse(w, req, dns.RcodeNotImplemented, "Unsupported QTYPE")
-        return
-    }
+	results := s.resolver.Resolve(question.Name, qtypeStr)
+	var hasValidAnswer bool
 
-    results := s.resolver.Resolve(question.Name, qtypeStr)
-    var hasValidAnswer bool
+	for _, res := range results {
+		rrStr := res.String()
+		rr, err := dns.NewRR(rrStr)
+		if err != nil {
+			fmt.Printf("Failed to parse RR '%s': %v\n", rrStr, err)
+			continue
+		}
+		reply.Answer = append(reply.Answer, rr)
+		hasValidAnswer = true
+	}
 
-    for _, res := range results {
-        rrStr := res.String()
-        rr, err := dns.NewRR(rrStr)
-        if err != nil {
-            fmt.Printf("Failed to parse RR '%s': %v\n", rrStr, err)
-            continue
-        }
-        reply.Answer = append(reply.Answer, rr)
-        hasValidAnswer = true
-    }
+	if !hasValidAnswer {
+		reply.SetRcode(req, dns.RcodeNameError)
+	}
 
-    if !hasValidAnswer {
-        reply.SetRcode(req, dns.RcodeNameError)
-    }
-
-    if err := w.WriteMsg(reply); err != nil {
-        fmt.Printf("Error writing response: %v\n", err)
-    }
+	if err := w.WriteMsg(reply); err != nil {
+		fmt.Printf("Error writing response: %v\n", err)
+	}
 }
 
 func (s *DNSServer) sendErrorResponse(w dns.ResponseWriter, req *dns.Msg, rcode int, message string) {
-    reply := new(dns.Msg)
-    reply.SetReply(req)
-    reply.Compress = true
-    reply.SetRcode(req, rcode)
+	reply := new(dns.Msg)
+	if req != nil && len(req.Question) > 0 {
+		reply.SetReply(req)
+	} else {
+		reply.SetRcode(req, rcode)
+	}
 
-    txtRecord := &dns.TXT{Hdr: dns.RR_Header{Name: req.Question[0].Name, Rrtype: dns.TypeTXT, Class: dns.ClassINET}, Txt: []string{message}}
-    reply.Extra = append(reply.Extra, txtRecord)
+	reply.Compress = true
+	reply.SetRcode(req, rcode)
 
-    if err := w.WriteMsg(reply); err != nil {
-        fmt.Printf("Error sending error response: %v\n", err)
-    }
+	if req != nil && len(req.Question) > 0 {
+		txtRecord := &dns.TXT{Hdr: dns.RR_Header{Name: req.Question[0].Name, Rrtype: dns.TypeTXT, Class: dns.ClassINET}, Txt: []string{message}}
+		reply.Extra = append(reply.Extra, txtRecord)
+	}
+
+	if err := w.WriteMsg(reply); err != nil {
+		fmt.Printf("Error sending error response: %v\n", err)
+	}
 }
 
 func main() {
-    server := NewDNSServer()
+	server := NewDNSServer()
+	go server.startCleaner()
 
-    udpServer := &dns.Server{Addr: ":5454", Net: "udp"}
-    dns.HandleFunc(".", server.handleRequest)
+	dns.HandleFunc(".", server.handleRequestWrapper)
 
-    go func() {
-        fmt.Println("DNS resolver (UDP) listening on port 5454")
-        if err := udpServer.ListenAndServe(); err != nil && err != net.ErrClosed {
-            fmt.Printf("Error starting UDP server: %v\n", err)
-        }
-    }()
+	udpServer := &dns.Server{Addr: ":5454", Net: "udp"}
+	go func() {
+		fmt.Println("DNS resolver (UDP) listening on port 5454")
+		if err := udpServer.ListenAndServe(); err != nil && err != net.ErrClosed {
+			fmt.Printf("Error starting UDP server: %v\n", err)
+		}
+	}()
 
-    tcpServer := &dns.Server{Addr: ":5454", Net: "tcp"}
-    go func() {
-        fmt.Println("DNS resolver (TCP) listening on port 5454")
-        if err := tcpServer.ListenAndServe(); err != nil && err != net.ErrClosed {
-            fmt.Printf("Error starting TCP server: %v\n", err)
-        }
-    }()
+	tcpServer := &dns.Server{Addr: ":5454", Net: "tcp"}
+	go func() {
+		fmt.Println("DNS resolver (TCP) listening on port 5454")
+		if err := tcpServer.ListenAndServe(); err != nil && err != net.ErrClosed {
+			fmt.Printf("Error starting TCP server: %v\n", err)
+		}
+	}()
 
-    select {}
+	select {}
 }
