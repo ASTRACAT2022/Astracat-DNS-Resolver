@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"net"
 	"runtime/debug"
@@ -97,10 +96,11 @@ func (s *DNSServer) handleRequest(w dns.ResponseWriter, req *dns.Msg) {
 		s.sendErrorResponse(w, req, dns.RcodeNotImplemented, "Unsupported QTYPE")
 		return
 	}
-	
-	// Здесь мы используем контекст для контроля таймаута
-	resultsChan := make(chan []*dnsr.Result, 1)
+
+	// Запускаем резолв в горутине, чтобы обрабатывать таймаут
+	resultsChan := make(chan []*dnsr.Record, 1)
 	go func() {
+		// Обертка для получения ответа от резолвера
 		resultsChan <- s.resolver.Resolve(question.Name, qtypeStr)
 	}()
 
@@ -127,7 +127,7 @@ func (s *DNSServer) handleRequest(w dns.ResponseWriter, req *dns.Msg) {
 			fmt.Printf("Error writing response: %v\n", err)
 		}
 	case <-time.After(5 * time.Second):
-		// Таймаут истек
+		// Таймаут истёк
 		s.sendErrorResponse(w, req, dns.RcodeServerFailure, "Query timeout")
 		return
 	}
@@ -138,7 +138,6 @@ func (s *DNSServer) sendErrorResponse(w dns.ResponseWriter, req *dns.Msg, rcode 
 	if req != nil && len(req.Question) > 0 {
 		reply.SetReply(req)
 	} else {
-		// Создаем пустой ответ, если запрос некорректен
 		reply.SetRcode(req, rcode)
 	}
 
