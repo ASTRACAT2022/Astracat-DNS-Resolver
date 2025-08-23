@@ -27,6 +27,7 @@ type cacheEntry struct {
 
 type DNSResolver interface {
 	LookupHost(host string) ([]net.IP, error)
+	LookupAAAA(host string) ([]net.IP, error)
 	LookupTXT(host string) ([]string, error)
 	LookupMX(host string) ([]*net.MX, error)
 	LookupCNAME(host string) (string, error)
@@ -59,6 +60,25 @@ func (r *MiekgDNSResolver) LookupHost(host string) ([]net.IP, error) {
 	for _, ans := range resp.Answer {
 		if a, ok := ans.(*dns.A); ok {
 			ips = append(ips, a.A)
+		}
+	}
+	return ips, nil
+}
+
+// LookupAAAA performs an AAAA record lookup.
+func (r *MiekgDNSResolver) LookupAAAA(host string) ([]net.IP, error) {
+	msg := new(dns.Msg)
+	msg.SetQuestion(dns.Fqdn(host), dns.TypeAAAA)
+
+	resp, _, err := r.Client.Exchange(msg, "8.8.8.8:53")
+	if err != nil {
+		return nil, err
+	}
+
+	var ips []net.IP
+	for _, ans := range resp.Answer {
+		if aaaa, ok := ans.(*dns.AAAA); ok {
+			ips = append(ips, aaaa.AAAA)
 		}
 	}
 	return ips, nil
@@ -375,10 +395,21 @@ func resolveQuestion(ctx context.Context, q dns.Question) ([]dns.RR, error) {
             }
         }
     case dns.TypeAAAA:
-        // bogdanovich/dns_resolver does not directly support AAAA, need to implement or find alternative
-        // For now, we'll skip AAAA or use a different approach if needed.
-        log.Printf("AAAA record type not directly supported by bogdanovich/dns_resolver, skipping for %s", q.Name)
-        return nil, fmt.Errorf("AAAA record type not directly supported")
+        ips, lookupErr := resolver.LookupAAAA(q.Name)
+        if lookupErr != nil {
+            err = lookupErr
+        } else {
+            foundRecords = true
+            for _, ip := range ips {
+                hdr := dns.RR_Header{
+                    Name:   dns.Fqdn(q.Name),
+                    Rrtype: dns.TypeAAAA,
+                    Class:  dns.ClassINET,
+                    Ttl:    300, // Default TTL
+                }
+                answers = append(answers, &dns.AAAA{Hdr: hdr, AAAA: ip.To16()})
+            }
+        }
     case dns.TypeCNAME:
         cname, lookupErr := resolver.LookupCNAME(q.Name)
         if lookupErr != nil {
@@ -494,8 +525,4 @@ func sendErrorResponse(conn *net.UDPConn, remoteAddr *net.UDPAddr, msg *dns.Msg,
 
 func printCacheStats() {
     log.Printf("Попадания в кэш: %d, промахи кэша: %d", cacheHits, cacheMisses)
-}
-
-func main() {
-	runServer()
 }
