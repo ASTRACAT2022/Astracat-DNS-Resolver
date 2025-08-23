@@ -195,8 +195,6 @@ func runServer() {
 
 
 
-
-
 func startDNSServer(conn *net.UDPConn) {
     buffer := make([]byte, 1024)
     for {
@@ -496,4 +494,8 @@ func sendErrorResponse(conn *net.UDPConn, remoteAddr *net.UDPAddr, msg *dns.Msg,
 
 func printCacheStats() {
     log.Printf("Попадания в кэш: %d, промахи кэша: %d", cacheHits, cacheMisses)
+}
+
+func main() {
+	runServer()
 }
