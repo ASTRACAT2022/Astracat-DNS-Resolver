@@ -12,6 +12,7 @@ import (
 	"github.com/miekg/dns"
 )
 
+// DNSServer содержит все необходимые компоненты DNS-сервера
 type DNSServer struct {
 	resolver        *dnsr.Resolver
 	visited         map[string]time.Time
@@ -23,14 +24,16 @@ const (
 	nxdomainLimit = 3
 )
 
+// NewDNSServer создаёт и инициализирует новый DNS-сервер
 func NewDNSServer() *DNSServer {
 	return &DNSServer{
-		resolver:        dnsr.NewResolver(dnsr.WithCache(100000), dnsr.WithExpiry()),
+		resolver:        dnsr.NewResolver(), // Используем резолвер без кэша по умолчанию
 		visited:         make(map[string]time.Time),
 		nxdomainCounter: make(map[string]int),
 	}
 }
 
+// startCleaner запускает фоновую горутину для очистки visited map
 func (s *DNSServer) startCleaner() {
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
@@ -48,6 +51,7 @@ func (s *DNSServer) startCleaner() {
 	}
 }
 
+// restartServer выполняет безопасный перезапуск процесса
 func restartServer() {
 	fmt.Println("NXDOMAIN limit reached. Restarting server...")
 	cmd := exec.Command(os.Args[0], os.Args[1:]...)
@@ -57,6 +61,7 @@ func restartServer() {
 	os.Exit(0)
 }
 
+// handleRequest обрабатывает входящие DNS-запросы
 func (s *DNSServer) handleRequest(w dns.ResponseWriter, req *dns.Msg) {
 	if len(req.Question) == 0 {
 		s.sendErrorResponse(w, req, dns.RcodeFormatError, "No questions in request")
@@ -66,6 +71,7 @@ func (s *DNSServer) handleRequest(w dns.ResponseWriter, req *dns.Msg) {
 	question := req.Question[0]
 	queryKey := fmt.Sprintf("%s:%d", question.Name, question.Qtype)
 
+	// Проверка на потенциальную рекурсию
 	s.mu.RLock()
 	_, exists := s.visited[queryKey]
 	s.mu.RUnlock()
@@ -100,18 +106,22 @@ func (s *DNSServer) handleRequest(w dns.ResponseWriter, req *dns.Msg) {
 		return
 	}
 
+	// Выполняем рекурсивный запрос
 	results := s.resolver.Resolve(question.Name, qtypeStr)
 	var hasValidAnswer bool
 
 	for _, res := range results {
-		rrStr := res.String()
-		rr, err := dns.NewRR(rrStr)
-		if err != nil {
-			fmt.Printf("Failed to parse RR '%s': %v\n", rrStr, err)
-			continue
+		// Проверяем, что ответ не является NXDOMAIN
+		if res.String() != "" {
+			rrStr := res.String()
+			rr, err := dns.NewRR(rrStr)
+			if err != nil {
+				fmt.Printf("Failed to parse RR '%s': %v\n", rrStr, err)
+				continue
+			}
+			reply.Answer = append(reply.Answer, rr)
+			hasValidAnswer = true
 		}
-		reply.Answer = append(reply.Answer, rr)
-		hasValidAnswer = true
 	}
 
 	if !hasValidAnswer {
@@ -121,9 +131,6 @@ func (s *DNSServer) handleRequest(w dns.ResponseWriter, req *dns.Msg) {
 			go restartServer()
 		}
 		s.mu.Unlock()
-
-		// Удаляем NXDOMAIN из кэша вручную
-		s.resolver.Evict(question.Name, question.Qtype)
 
 		reply.SetRcode(req, dns.RcodeNameError)
 		if err := w.WriteMsg(reply); err != nil {
@@ -141,6 +148,7 @@ func (s *DNSServer) handleRequest(w dns.ResponseWriter, req *dns.Msg) {
 	}
 }
 
+// sendErrorResponse отправляет ответ с ошибкой клиенту
 func (s *DNSServer) sendErrorResponse(w dns.ResponseWriter, req *dns.Msg, rcode int, message string) {
 	reply := new(dns.Msg)
 	if req != nil && len(req.Question) > 0 {
