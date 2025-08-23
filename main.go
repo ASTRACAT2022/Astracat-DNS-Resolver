@@ -102,7 +102,15 @@ func (s *DNSServer) handleRequest(conn net.Conn) {
 		}
 
 		results := s.resolver.Resolve(question.Name, qtypeStr)
-		reply.Answer = results
+		for _, res := range results {
+			rrStr := res.String()
+			rr, err := dns.NewRR(rrStr)
+			if err == nil {
+				reply.Answer = append(reply.Answer, rr)
+			} else {
+				fmt.Printf("Ошибка конвертации RR: %v для %s\n", err, rrStr)
+			}
+		}
 		if len(results) == 0 {
 			reply.SetRcode(msg, dns.RcodeNameError)
 		}
