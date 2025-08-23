@@ -97,16 +97,13 @@ func (s *DNSServer) handleRequest(w dns.ResponseWriter, req *dns.Msg) {
 		return
 	}
 
-	// Запускаем резолв в горутине, чтобы обрабатывать таймаут
-	resultsChan := make(chan []*dnsr.Record, 1)
+	resultsChan := make(chan []*dnsr.Result, 1)
 	go func() {
-		// Обертка для получения ответа от резолвера
 		resultsChan <- s.resolver.Resolve(question.Name, qtypeStr)
 	}()
 
 	select {
 	case results := <-resultsChan:
-		// Успешно получили ответ до таймаута
 		var hasValidAnswer bool
 		for _, res := range results {
 			rrStr := res.String()
@@ -127,7 +124,6 @@ func (s *DNSServer) handleRequest(w dns.ResponseWriter, req *dns.Msg) {
 			fmt.Printf("Error writing response: %v\n", err)
 		}
 	case <-time.After(5 * time.Second):
-		// Таймаут истёк
 		s.sendErrorResponse(w, req, dns.RcodeServerFailure, "Query timeout")
 		return
 	}
