@@ -908,7 +908,7 @@ func main() {
 
     udpServer := &dns.Server{Addr: ":5354", Net: "udp"}
     go func() {
-        fmt.Println("DNS resolver (UDP) listening on port 53")
+        fmt.Println("DNS resolver (UDP) listening on port 5454")
         if err := udpServer.ListenAndServe(); err != nil && err != net.ErrClosed {
             fmt.Printf("Error starting UDP server: %v\n", err)
         }
@@ -916,7 +916,7 @@ func main() {
 
     tcpServer := &dns.Server{Addr: ":5354", Net: "tcp"}
     go func() {
-        fmt.Println("DNS resolver (TCP) listening on port 53")
+        fmt.Println("DNS resolver (TCP) listening on port 5454")
         if err := tcpServer.ListenAndServe(); err != nil && err != net.ErrClosed {
             fmt.Printf("Error starting TCP server: %v\n", err)
         }
