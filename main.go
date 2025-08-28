@@ -906,7 +906,7 @@ func main() {
     // Запуск DNS сервера
     dns.HandleFunc(".", server.handleRequest)
 
-    udpServer := &dns.Server{Addr: ":5354", Net: "udp"}
+    udpServer := &dns.Server{Addr: ":5454", Net: "udp"}
     go func() {
         fmt.Println("DNS resolver (UDP) listening on port 5454")
         if err := udpServer.ListenAndServe(); err != nil && err != net.ErrClosed {
@@ -914,7 +914,7 @@ func main() {
         }
     }()
 
-    tcpServer := &dns.Server{Addr: ":5354", Net: "tcp"}
+    tcpServer := &dns.Server{Addr: ":5454", Net: "tcp"}
     go func() {
         fmt.Println("DNS resolver (TCP) listening on port 5454")
         if err := tcpServer.ListenAndServe(); err != nil && err != net.ErrClosed {
