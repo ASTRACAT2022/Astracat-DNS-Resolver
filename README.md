@@ -1,6 +1,6 @@
 # DNS Resolver
 
-Полноценный DNS resolver, использующий библиотеку [dnsr](https://github.com/domainr/dnsr), созданный как аналог PowerDNS с высокой производительностью и кэшированием.
+
 
 ## Особенности
 
