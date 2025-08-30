@@ -1,0 +1,10 @@
+[Unit]
+Description=DNR Recursive DNS Server
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/DNR
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
