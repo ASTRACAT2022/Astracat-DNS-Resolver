@@ -1,3 +1,0 @@
-bin_PROGRAMS=DNR
-DNR_SOURCES=DNR.cpp
-
