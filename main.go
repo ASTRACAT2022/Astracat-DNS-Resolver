@@ -15,6 +15,7 @@ import (
 	"math/big"
 	"net"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -423,3 +424,406 @@ func (s *DNSServer) handleRequest(w dns.ResponseWriter, req *dns.Msg) {
 					}
 				}
 			}
+		}
+	}
+
+	// Применение результата DNSSEC перед отправкой
+	if isDNSSECValidationAttempted && dnssecValidationResult == DNSSEC_SECURE {
+		reply.MsgHdr.AuthenticatedData = true
+	}
+	
+	if err := w.WriteMsg(reply); err != nil {
+		fmt.Printf("Ошибка записи ответа: %v\n", err)
+	}
+}
+
+// validateDNSSEC проверяет DNSSEC-подпись ответа
+func (s *DNSServer) validateDNSSEC(qname string, reply *dns.Msg) DNSSECValidationResult {
+	fmt.Printf("Начало проверки DNSSEC для %s\n", qname)
+	
+	// Извлечение RRSIG и RRSET
+	var rrsigs []*dns.RRSIG
+	var rrset []dns.RR
+	
+	for _, rr := range reply.Answer {
+		if rrsig, ok := rr.(*dns.RRSIG); ok {
+			rrsigs = append(rrsigs, rrsig)
+		} else {
+			rrset = append(rrset, rr)
+		}
+	}
+	
+	if len(rrsigs) == 0 {
+		fmt.Printf("Нет RRSIG записей для проверки %s\n", qname)
+		return DNSSEC_INDETERMINATE
+	}
+	
+	if len(rrset) == 0 {
+		fmt.Printf("Нет RRSET для проверки %s\n", qname)
+		return DNSSEC_INDETERMINATE
+	}
+	
+	// Проверка каждой подписи
+	for _, rrsig := range rrsigs {
+		fmt.Printf("Проверка RRSIG: %s\n", rrsig.String())
+		
+		// Получение DNSKEY
+		dnskey, err := s.getDNSKEY(rrsig.SignerName, rrsig.KeyTag, rrsig.Algorithm)
+		if err != nil {
+			fmt.Printf("Не удалось получить DNSKEY для %s: %v\n", rrsig.SignerName, err)
+			return DNSSEC_INDETERMINATE
+		}
+		
+		if dnskey == nil {
+			fmt.Printf("DNSKEY не найден для %s\n", rrsig.SignerName)
+			return DNSSEC_INDETERMINATE
+		}
+		
+		// Проверка подписи
+		err = rrsig.Verify(dnskey, rrset)
+		if err != nil {
+			fmt.Printf("Проверка подписи провалилась для %s: %v\n", qname, err)
+			return DNSSEC_BOGUS
+		}
+		
+		fmt.Printf("Подпись проверена успешно для %s\n", qname)
+	}
+	
+	return DNSSEC_SECURE
+}
+
+// validateNegativeResponse проверяет DNSSEC для отрицательных ответов
+func (s *DNSServer) validateNegativeResponse(qname string, reply *dns.Msg) DNSSECValidationResult {
+	fmt.Printf("Проверка DNSSEC для отрицательного ответа: %s\n", qname)
+	
+	// Поиск NSEC/NSEC3 и RRSIG записей
+	var nsecRecords []dns.RR
+	var rrsigs []*dns.RRSIG
+	
+	for _, rr := range reply.Ns {
+		switch rr.(type) {
+		case *dns.NSEC:
+			nsecRecords = append(nsecRecords, rr)
+		case *dns.NSEC3:
+			nsecRecords = append(nsecRecords, rr)
+		case *dns.RRSIG:
+			if rrsig, ok := rr.(*dns.RRSIG); ok {
+				if rrsig.TypeCovered == dns.TypeNSEC || rrsig.TypeCovered == dns.TypeNSEC3 {
+					rrsigs = append(rrsigs, rrsig)
+				}
+			}
+		}
+	}
+	
+	if len(nsecRecords) == 0 || len(rrsigs) == 0 {
+		fmt.Printf("Нет NSEC/NSEC3 или RRSIG записей для проверки отрицательного ответа %s\n", qname)
+		return DNSSEC_INDETERMINATE
+	}
+	
+	// Проверка подписей
+	for _, rrsig := range rrsigs {
+		dnskey, err := s.getDNSKEY(rrsig.SignerName, rrsig.KeyTag, rrsig.Algorithm)
+		if err != nil || dnskey == nil {
+			fmt.Printf("Не удалось получить DNSKEY для отрицательного ответа %s: %v\n", qname, err)
+			return DNSSEC_INDETERMINATE
+		}
+		
+		err = rrsig.Verify(dnskey, nsecRecords)
+		if err != nil {
+			fmt.Printf("Проверка подписи отрицательного ответа провалилась для %s: %v\n", qname, err)
+			return DNSSEC_BOGUS
+		}
+	}
+	
+	return DNSSEC_SECURE
+}
+
+// getDNSKEY получает DNSKEY по имени, тегу и алгоритму
+func (s *DNSServer) getDNSKEY(signerName string, keyTag uint16, algorithm uint8) (*dns.DNSKEY, error) {
+	cacheKey := fmt.Sprintf("%s:%d:%d", signerName, keyTag, algorithm)
+	
+	// Проверка кэша
+	if cached, ok := s.keyCache.Load(cacheKey); ok {
+		if cachedTime, ok := s.keyCacheTime.Load(cacheKey); ok {
+			if time.Since(cachedTime.(time.Time)) < keyCacheTTL {
+				atomic.AddUint64(&s.cacheHits, 1)
+				return cached.(*dns.DNSKEY), nil
+			}
+		}
+	}
+	
+	atomic.AddUint64(&s.cacheMisses, 1)
+	
+	// Получение через резолвер
+	results := s.resolver.Resolve(signerName, "DNSKEY")
+	for _, res := range results {
+		if rr, err := dns.NewRR(res.String()); err == nil {
+			if dnskey, ok := rr.(*dns.DNSKEY); ok {
+				if dnskey.KeyTag() == keyTag && dnskey.Algorithm == algorithm {
+					// Кэширование
+					s.keyCache.Store(cacheKey, dnskey)
+					s.keyCacheTime.Store(cacheKey, time.Now())
+					return dnskey, nil
+				}
+			}
+		}
+	}
+	
+	// Если не найдено через резолвер, попробуем получить через авторитетные серверы
+	dnskey, err := s.fetchDNSKEYFromAuthoritative(signerName, keyTag, algorithm)
+	if err == nil && dnskey != nil {
+		s.keyCache.Store(cacheKey, dnskey)
+		s.keyCacheTime.Store(cacheKey, time.Now())
+		return dnskey, nil
+	}
+	
+	return nil, fmt.Errorf("DNSKEY не найден для %s, tag=%d, alg=%d", signerName, keyTag, algorithm)
+}
+
+// fetchDNSKEYFromAuthoritative получает DNSKEY напрямую от авторитетных серверов
+func (s *DNSServer) fetchDNSKEYFromAuthoritative(signerName string, keyTag uint16, algorithm uint8) (*dns.DNSKEY, error) {
+	// Получение NS записей
+	nsResults := s.qnameMinimizeResolve(signerName, "NS")
+	if len(nsResults) == 0 {
+		return nil, fmt.Errorf("NS записи не найдены для %s", signerName)
+	}
+	
+	// Получение A/AAAA записей для NS
+	var nsIPs []string
+	for _, nsRes := range nsResults {
+		if rr, err := dns.NewRR(nsRes); err == nil {
+			if ns, ok := rr.(*dns.NS); ok {
+				aResults := s.qnameMinimizeResolve(ns.Ns, "A")
+				for _, aRes := range aResults {
+					if aRR, err := dns.NewRR(aRes); err == nil {
+						if a, ok := aRR.(*dns.A); ok {
+							nsIPs = append(nsIPs, a.A.String())
+						}
+					}
+				}
+				aaaaResults := s.qnameMinimizeResolve(ns.Ns, "AAAA")
+				for _, aaaaRes := range aaaaResults {
+					if aaaaRR, err := dns.NewRR(aaaaRes); err == nil {
+						if aaaa, ok := aaaaRR.(*dns.AAAA); ok {
+							nsIPs = append(nsIPs, aaaa.AAAA.String())
+						}
+					}
+				}
+			}
+		}
+	}
+	
+	if len(nsIPs) == 0 {
+		return nil, fmt.Errorf("IP адреса NS серверов не найдены для %s", signerName)
+	}
+	
+	// Запрос DNSKEY у первого доступного NS сервера
+	c := &dns.Client{Timeout: 5 * time.Second}
+	msg := &dns.Msg{}
+	msg.SetQuestion(dns.Fqdn(signerName), dns.TypeDNSKEY)
+	
+	for _, nsIP := range nsIPs {
+		addr := net.JoinHostPort(nsIP, "53")
+		resp, _, err := c.Exchange(msg, addr)
+		if err != nil {
+			continue
+		}
+		
+		for _, rr := range resp.Answer {
+			if dnskey, ok := rr.(*dns.DNSKEY); ok {
+				if dnskey.KeyTag() == keyTag && dnskey.Algorithm == algorithm {
+					return dnskey, nil
+				}
+			}
+		}
+	}
+	
+	return nil, fmt.Errorf("не удалось получить DNSKEY от авторитетных серверов")
+}
+
+// qnameMinimizeResolve выполняет рекурсивное разрешение с минимизацией QNAME
+func (s *DNSServer) qnameMinimizeResolve(qname, qtype string) []string {
+	labels := dns.SplitDomainName(qname)
+	var results []string
+	
+	// Начинаем с корня и двигаемся вниз
+	for i := len(labels); i >= 0; i-- {
+		var currentName string
+		if i == len(labels) {
+			currentName = "."
+		} else {
+			currentName = strings.Join(labels[i:], ".") + "."
+		}
+		
+		res := s.resolver.Resolve(currentName, "NS")
+		if len(res) > 0 {
+			// Найдены NS записи, теперь запросим нужный тип
+			if i == 0 {
+				// Это целевой домен
+				targetResults := s.resolver.Resolve(qname, qtype)
+				results = append(results, targetResults...)
+				break
+			}
+		}
+	}
+	
+	return results
+}
+
+// fetchFromAuthoritative получает записи напрямую от авторитетных серверов
+func (s *DNSServer) fetchFromAuthoritative(qname string, qtype uint16) ([]dns.RR, []*dns.RRSIG) {
+	var rrset []dns.RR
+	var rrsigs []*dns.RRSIG
+	
+	// Получение NS записей через минимизацию QNAME
+	labels := dns.SplitDomainName(qname)
+	
+	for i := 0; i <= len(labels); i++ {
+		var zone string
+		if i == len(labels) {
+			zone = "."
+		} else {
+			zone = strings.Join(labels[i:], ".") + "."
+		}
+		
+		nsResults := s.resolver.Resolve(zone, "NS")
+		if len(nsResults) > 0 {
+			// Найдены NS серверы для этой зоны
+			for _, nsRes := range nsResults {
+				if rr, err := dns.NewRR(nsRes); err == nil {
+					if _, ok := rr.(*dns.NS); ok {
+						// Получаем IP адреса NS серверов
+						nsName := rr.Header().Name
+						aResults := s.resolver.Resolve(nsName, "A")
+						for _, aRes := range aResults {
+							if aRR, err := dns.NewRR(aRes); err == nil {
+								if a, ok := aRR.(*dns.A); ok {
+									// Запрашиваем записи у NS сервера
+									c := &dns.Client{Timeout: 5 * time.Second}
+									msg := &dns.Msg{}
+									msg.SetQuestion(dns.Fqdn(qname), qtype)
+									msg.SetEdns0(4096, true) // Запрашиваем DNSSEC
+									
+									addr := net.JoinHostPort(a.A.String(), "53")
+									resp, _, err := c.Exchange(msg, addr)
+									if err == nil {
+										for _, answer := range resp.Answer {
+											if answer.Header().Rrtype == qtype {
+												rrset = append(rrset, answer)
+											} else if answer.Header().Rrtype == dns.TypeRRSIG {
+												if rrsig, ok := answer.(*dns.RRSIG); ok {
+													if rrsig.TypeCovered == qtype {
+														rrsigs = append(rrsigs, rrsig)
+													}
+												}
+											}
+										}
+										return rrset, rrsigs
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	
+	return rrset, rrsigs
+}
+
+// fetchDNSSECRecordsAsync асинхронно получает DNSSEC записи
+func (s *DNSServer) fetchDNSSECRecordsAsync(qname string) ([]dns.RR, []*dns.DNSKEY, []*dns.DS, error) {
+	var rrs []dns.RR
+	var keys []*dns.DNSKEY
+	var dsRecords []*dns.DS
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	
+	// Получение RRSIG
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		results := s.resolver.Resolve(qname, "RRSIG")
+		mu.Lock()
+		defer mu.Unlock()
+		for _, res := range results {
+			if rr, err := dns.NewRR(res); err == nil {
+				rrs = append(rrs, rr)
+			}
+		}
+	}()
+	
+	// Получение DNSKEY
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		results := s.resolver.Resolve(qname, "DNSKEY")
+		mu.Lock()
+		defer mu.Unlock()
+		for _, res := range results {
+			if rr, err := dns.NewRR(res); err == nil {
+				if key, ok := rr.(*dns.DNSKEY); ok {
+					keys = append(keys, key)
+				}
+			}
+		}
+	}()
+	
+	// Получение DS
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		results := s.resolver.Resolve(qname, "DS")
+		mu.Lock()
+		defer mu.Unlock()
+		for _, res := range results {
+			if rr, err := dns.NewRR(res); err == nil {
+				if ds, ok := rr.(*dns.DS); ok {
+					dsRecords = append(dsRecords, ds)
+				}
+			}
+		}
+	}()
+	
+	wg.Wait()
+	
+	if len(rrs) == 0 && len(keys) == 0 && len(dsRecords) == 0 {
+		return rrs, keys, dsRecords, fmt.Errorf("DNSSEC записи не найдены")
+	}
+	
+	return rrs, keys, dsRecords, nil
+}
+
+// sendErrorResponse отправляет ошибочный ответ
+func (s *DNSServer) sendErrorResponse(w dns.ResponseWriter, req *dns.Msg, rcode int, errMsg string) {
+	fmt.Printf("Ошибка: %s\n", errMsg)
+	reply := new(dns.Msg)
+	reply.SetRcode(req, rcode)
+	w.WriteMsg(reply)
+}
+
+// Start запускает DNS-сервер
+func (s *DNSServer) Start(addr string) error {
+	// Запуск очистки кэша в отдельной горутине
+	go s.startCleaner()
+	
+	// Регистрация обработчика
+	dns.HandleFunc(".", s.handleRequest)
+	
+	// Создание сервера
+	server := &dns.Server{
+		Addr: addr,
+		Net:  "udp",
+	}
+	
+	fmt.Printf("DNS-сервер запущен на %s\n", addr)
+	return server.ListenAndServe()
+}
+
+func main() {
+	server := NewDNSServer()
+	if err := server.Start(":53"); err != nil {
+		fmt.Printf("Ошибка запуска сервера: %v\n", err)
+	}
+}
