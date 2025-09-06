@@ -2,9 +2,7 @@ package main
 
 import (
 	"fmt"
-	"math/big"
 	"net"
-	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -12,7 +10,7 @@ import (
 
 	"github.com/domainr/dnsr"
 	"github.com/miekg/dns"
-	"golang.org/x/crypto/ed25519"
+	
 )
 
 // DNSServer содержит все необходимые компоненты для DNS-сервера
