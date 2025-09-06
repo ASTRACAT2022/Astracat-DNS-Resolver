@@ -814,7 +814,7 @@ func (s *DNSServer) Start(addr string) error {
 
 func main() {
 	server := NewDNSServer()
-	if err := server.Start(":53"); err != nil {
+	if err := server.Start(":5454"); err != nil {
 		fmt.Printf("Ошибка запуска сервера: %v\n", err)
 	}
 }
