@@ -275,13 +275,19 @@ func (s *DNSServer) handleRequest(w dns.ResponseWriter, req *dns.Msg) {
 		}
 	}
 
+	// Track DNSSEC validation result separately
+	dnssecValidationResult := DNSSEC_INDETERMINATE // Default assumption
+	isDNSSECValidationAttempted := false
+
 	// Handle NXDOMAIN
 	if !hasValidAnswer {
 		if clientRequestsDNSSEC {
+			isDNSSECValidationAttempted = true
 			validationResult := s.validateNegativeResponse(question.Name, reply)
+			dnssecValidationResult = validationResult
 			switch validationResult {
 			case DNSSEC_SECURE:
-				reply.MsgHdr.AuthenticatedData = true
+				// Do not set AD yet, wait until final processing
 				atomic.AddUint64(&s.secureQueries, 1)
 				fmt.Printf("DNSSEC validation successful for negative response %s\n", question.Name)
 			case DNSSEC_BOGUS:
@@ -309,6 +315,10 @@ func (s *DNSServer) handleRequest(w dns.ResponseWriter, req *dns.Msg) {
 		}
 
 		reply.SetRcode(req, dns.RcodeNameError)
+		// Apply DNSSEC result before sending
+		if isDNSSECValidationAttempted && dnssecValidationResult == DNSSEC_SECURE {
+			reply.MsgHdr.AuthenticatedData = true
+		}
 		if err := w.WriteMsg(reply); err != nil {
 			fmt.Printf("Error writing response: %v\n", err)
 		}
@@ -317,6 +327,7 @@ func (s *DNSServer) handleRequest(w dns.ResponseWriter, req *dns.Msg) {
 
 	// Handle DNSSEC validation
 	if s.dnssecEnabled && clientRequestsDNSSEC && hasValidAnswer {
+		isDNSSECValidationAttempted = true
 		// Check if we have RRSIGs for the answer
 		hasRRSIGs := false
 		for _, rr := range reply.Answer {
@@ -329,9 +340,10 @@ func (s *DNSServer) handleRequest(w dns.ResponseWriter, req *dns.Msg) {
 		fmt.Printf("Checking for RRSIGs in answer: hasRRSIGs=%v\n", hasRRSIGs)
 		if hasRRSIGs {
 			validationResult := s.validateDNSSEC(question.Name, reply)
+			dnssecValidationResult = validationResult
 			switch validationResult {
 			case DNSSEC_SECURE:
-				reply.MsgHdr.AuthenticatedData = true
+				// Do not set AD yet, wait until final processing
 				atomic.AddUint64(&s.secureQueries, 1)
 				fmt.Printf("DNSSEC validation successful for %s\n", question.Name)
 			case DNSSEC_BOGUS:
@@ -374,9 +386,10 @@ func (s *DNSServer) handleRequest(w dns.ResponseWriter, req *dns.Msg) {
 			}
 			if hasRRSIGs {
 				validationResult := s.validateDNSSEC(question.Name, reply)
+				dnssecValidationResult = validationResult
 				switch validationResult {
 				case DNSSEC_SECURE:
-					reply.MsgHdr.AuthenticatedData = true
+					// Do not set AD yet, wait until final processing
 					atomic.AddUint64(&s.secureQueries, 1)
 					fmt.Printf("DNSSEC validation successful for %s\n", question.Name)
 				case DNSSEC_BOGUS:
@@ -396,17 +409,28 @@ func (s *DNSServer) handleRequest(w dns.ResponseWriter, req *dns.Msg) {
 				if err != nil {
 					fmt.Printf("Error fetching DNSSEC records for diagnostic: %v\n", err)
 					atomic.AddUint64(&s.indeterminateQueries, 1)
+					dnssecValidationResult = DNSSEC_INDETERMINATE
 				} else {
 					if len(rrs) == 0 && len(keys) == 0 && len(dsRecs) == 0 {
 						fmt.Printf("No DNSSEC records found for %s — treating as INSECURE\n", question.Name)
 						atomic.AddUint64(&s.insecureQueries, 1)
+						dnssecValidationResult = DNSSEC_INSECURE
 					} else {
 						fmt.Printf("DNSSEC artifacts present but no usable RRSIG for %s — treating as INDETERMINATE\n", question.Name)
 						atomic.AddUint64(&s.indeterminateQueries, 1)
+						dnssecValidationResult = DNSSEC_INDETERMINATE
 					}
 				}
 			}
 		}
+	} else if !clientRequestsDNSSEC {
+		// Client did not request DNSSEC, so it's implicitly insecure from DNSSEC perspective
+		dnssecValidationResult = DNSSEC_INSECURE
+		isDNSSECValidationAttempted = false // Not attempted because not requested
+	} else {
+		// DNSSEC enabled but no answer or client didn't request it
+		dnssecValidationResult = DNSSEC_INSECURE
+		isDNSSECValidationAttempted = false
 	}
 
 	// Clear NXDOMAIN counters on successful query
@@ -416,6 +440,16 @@ func (s *DNSServer) handleRequest(w dns.ResponseWriter, req *dns.Msg) {
 	// Check response size
 	if reply.Len() > int(udpSize) && w.RemoteAddr().Network() == "udp" {
 		reply.Truncated = true
+	}
+
+	// --- CRITICAL: Set AuthenticatedData flag just before sending ---
+	// Ensure we only set AD if DNSSEC was requested and validation was successful
+	if clientRequestsDNSSEC && isDNSSECValidationAttempted && dnssecValidationResult == DNSSEC_SECURE {
+		fmt.Printf("Setting AD flag in final response for %s\n", question.Name)
+		reply.MsgHdr.AuthenticatedData = true
+	} else if clientRequestsDNSSEC {
+		fmt.Printf("NOT setting AD flag. Requested: %v, Attempted: %v, Result: %v\n", 
+			clientRequestsDNSSEC, isDNSSECValidationAttempted, dnssecValidationResult)
 	}
 
 	if err := w.WriteMsg(reply); err != nil {
@@ -697,8 +731,9 @@ func (s *DNSServer) getRRSet(rrset []dns.RR, qtype uint16, labels uint8, origTTL
 							newname += "."
 						}
 					}
-					newname = dns.Fqdn(newname)
-					hdr.Name = strings.ToLower(dns.CanonicalName(newname))
+					newname += "."
+					canonicalNewName := strings.ToLower(dns.CanonicalName(newname))
+					hdr.Name = canonicalNewName
 				}
 			} else {
 				hdr.Name = strings.ToLower(dns.CanonicalName(hdr.Name))
@@ -1179,182 +1214,33 @@ func (s *DNSServer) fetchDNSKEY(domain string, keyTag uint16, algorithm uint8) *
 	return nil
 }
 
-// fetchDS fetches DS records for a domain by querying the parent zone's authoritative servers.
-// This implementation directly queries the parent zone's authoritative name servers.
+// fetchDS fetches DS records for a domain
 func (s *DNSServer) fetchDS(domain string) ([]*dns.DS, error) {
-	fmt.Printf("fetchDS: fetching DS records for %s by querying parent zone's authoritative servers\n", domain)
-
-	parent := s.getParentDomain(domain)
-	if parent == domain || (parent == "." && domain != ".") {
-		// Special case for root or when we reach the top - there's no parent to query for DS
-		fmt.Printf("fetchDS: reached root or top level for %s, no parent DS exists\n", domain)
-		// For root zone, validation should be against the trust anchor in validateTrustChain
-		return nil, nil
-	}
-
-	fmt.Printf("fetchDS: Parent zone for %s is %s\n", domain, parent)
-
-	// 1. Get authoritative NS servers for the parent zone
-	// We cannot use s.resolver.Resolve here directly for NS as we need the authoritative source for DS.
-	// We will use qnameMinimizeResolve to find the NS of the parent first.
-	nsResults := s.qnameMinimizeResolve(parent, "NS")
-	if len(nsResults) == 0 {
-		fmt.Printf("fetchDS: failed to get NS servers for parent zone %s\n", parent)
-		return nil, fmt.Errorf("no NS servers found for parent zone %s", parent)
-	}
-
-	var nsNames []string
-	for _, r := range nsResults {
-		if rr, err := dns.NewRR(r); err == nil {
-			if ns, ok := rr.(*dns.NS); ok {
-				nsNames = append(nsNames, dns.Fqdn(ns.Ns))
-			}
-		}
-	}
-
-	if len(nsNames) == 0 {
-		fmt.Printf("fetchDS: failed to parse any NS servers from results for parent %s\n", parent)
-		return nil, fmt.Errorf("no valid NS servers found for parent zone %s", parent)
-	}
-
-	fmt.Printf("fetchDS: Found NS servers for parent %s: %v\n", parent, nsNames)
-
-	// 2. Resolve IP addresses for these parent NS servers
-	// Try to resolve them using our own resolver first
-	var parentNSIPs []string
-	for _, nsName := range nsNames {
-		// Try to get A record
-		aResults := s.qnameMinimizeResolve(nsName, "A")
-		for _, r := range aResults {
-			if rr, err := dns.NewRR(r); err == nil {
-				if a, ok := rr.(*dns.A); ok {
-					parentNSIPs = append(parentNSIPs, a.A.String())
-				}
-			}
-		}
-		// Try to get AAAA record
-		aaaaResults := s.qnameMinimizeResolve(nsName, "AAAA")
-		for _, r := range aaaaResults {
-			if rr, err := dns.NewRR(r); err == nil {
-				if aaaa, ok := rr.(*dns.AAAA); ok {
-					parentNSIPs = append(parentNSIPs, aaaa.AAAA.String())
-				}
-			}
-		}
-	}
-
-	// If our resolver couldn't find IPs, fall back to system resolver
-	if len(parentNSIPs) == 0 {
-		fmt.Printf("fetchDS: No IPs found via internal resolver for parent NS, trying system resolver\n")
-		for _, nsName := range nsNames {
-			ips, err := net.LookupIP(nsName)
-			if err != nil {
-				fmt.Printf("fetchDS: System lookup failed for %s: %v\n", nsName, err)
-				continue
-			}
-			for _, ip := range ips {
-				parentNSIPs = append(parentNSIPs, ip.String())
-			}
-		}
-	}
-
-	if len(parentNSIPs) == 0 {
-		fmt.Printf("fetchDS: failed to resolve any IP addresses for parent NS servers\n")
-		return nil, fmt.Errorf("could not resolve IPs for parent NS servers of %s", parent)
-	}
-
-	fmt.Printf("fetchDS: Resolved IPs for parent NS: %v\n", parentNSIPs)
-
-	// 3. Query one of the parent NS IPs directly for the DS record of 'domain'
-	domainFQDN := dns.Fqdn(domain)
+	fmt.Printf("fetchDS: fetching DS records for %s\n", domain)
 	var dsRecords []*dns.DS
-
-	// Try up to 3 different parent NS IPs to increase robustness
-	ipsToTry := parentNSIPs
-	if len(ipsToTry) > 3 {
-		ipsToTry = ipsToTry[:3]
+	results := s.qnameMinimizeResolve(domain, "DS")
+	fmt.Printf("fetchDS: DS resolution for %s returned %d results\n", domain, len(results))
+	
+	// Log all results for debugging
+	for i, r := range results {
+		fmt.Printf("fetchDS: DS result %d: %s\n", i, r)
 	}
-
-	for _, ip := range ipsToTry {
-		addr := net.JoinHostPort(ip, "53")
-		client := &dns.Client{
-			Net:     "udp",
-			Timeout: 5 * time.Second,
-		}
-
-		// Create the DS query message
-		msg := new(dns.Msg)
-		msg.SetQuestion(domainFQDN, dns.TypeDS)
-		// Enable EDNS0 and DO bit for DNSSEC
-		opt := new(dns.OPT)
-		opt.Hdr.Name = "."
-		opt.Hdr.Rrtype = dns.TypeOPT
-		opt.SetUDPSize(dns.DefaultMsgSize) // Use default size, can be adjusted
-		opt.SetDo()                        // Set DNSSEC OK bit
-		msg.Extra = append(msg.Extra, opt)
-
-		fmt.Printf("fetchDS: Sending DS query for %s to parent NS at %s\n", domainFQDN, addr)
-		response, _, err := client.Exchange(msg, addr)
-
-		if err != nil {
-			fmt.Printf("fetchDS: UDP query to %s failed: %v, trying TCP\n", addr, err)
-			// Fallback to TCP
-			client.Net = "tcp"
-			response, _, err = client.Exchange(msg, addr)
-			if err != nil {
-				fmt.Printf("fetchDS: TCP query to %s also failed: %v\n", addr, err)
-				continue // Try the next IP address
-			}
-		}
-
-		if response == nil {
-			fmt.Printf("fetchDS: Received nil response from %s\n", addr)
-			continue
-		}
-
-		// Check the response code
-		if response.Rcode != dns.RcodeSuccess {
-			fmt.Printf("fetchDS: Received RCODE %d from %s for DS query of %s\n", response.Rcode, addr, domainFQDN)
-			// NXDOMAIN for a DS query means the domain is not signed (insecure delegation)
-			if response.Rcode == dns.RcodeNameError {
-				fmt.Printf("fetchDS: NXDOMAIN from %s for DS query, indicating insecure delegation of %s\n", addr, domain)
-				// Return empty slice, not an error, as this is a valid DNSSEC state
-				return nil, nil
-			}
-			// Continue to try another IP
-			continue
-		}
-
-		// Process the answer section of the response
-		fmt.Printf("fetchDS: Received successful response from %s\n", addr)
-		for _, rr := range response.Answer {
-			fmt.Printf("fetchDS: Processing answer record: %s\n", rr.String())
+	
+	for i, r := range results {
+		fmt.Printf("fetchDS: processing result %d: %s\n", i, r)
+		if rr, err := dns.NewRR(r); err == nil {
 			if ds, ok := rr.(*dns.DS); ok {
-				// Verify the DS record is for the domain we are interested in
-				if strings.EqualFold(dns.CanonicalName(ds.Hdr.Name), dns.CanonicalName(domainFQDN)) {
-					dsRecords = append(dsRecords, ds)
-					fmt.Printf("fetchDS: Found DS record: KeyTag=%d, Algorithm=%d, DigestType=%d\n",
-						ds.KeyTag, ds.Algorithm, ds.DigestType)
-				} else {
-					fmt.Printf("fetchDS: DS record for a different name: %s\n", ds.Hdr.Name)
-				}
+				dsRecords = append(dsRecords, ds)
+				fmt.Printf("fetchDS: parsed DS record: keytag %d, algorithm %d, digest type %d\n",
+					ds.KeyTag, ds.Algorithm, ds.DigestType)
 			} else {
-				fmt.Printf("fetchDS: Non-DS record in answer section: %T\n", rr)
-				// Sometimes NSEC/NSEC3 records might be present if DS doesn't exist
+				fmt.Printf("fetchDS: RR is not a DS: %T, RR: %s\n", rr, rr.String())
 			}
+		} else {
+			fmt.Printf("fetchDS: failed to parse RR: %v, RR string: %s\n", err, r)
 		}
-
-		// If we got a response (success or proven non-existence), we can stop trying other IPs
-		// An empty dsRecords slice here means DS doesn't exist (insecure delegation)
-		break
 	}
-
-	if len(dsRecords) == 0 {
-		fmt.Printf("fetchDS: No DS records found for %s in parent zone %s. This likely indicates insecure delegation.\n", domain, parent)
-	} else {
-		fmt.Printf("fetchDS: Successfully fetched %d DS records for %s\n", len(dsRecords), domain)
-	}
-
+	fmt.Printf("fetchDS: returning %d DS records for %s\n", len(dsRecords), domain)
 	return dsRecords, nil
 }
 
