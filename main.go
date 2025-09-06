@@ -1,16 +1,6 @@
 package main
 
 import (
-	"context"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/sha1"
-	"crypto/sha256"
-	"crypto/sha512"
-	"encoding/base32"
-	"encoding/base64"
-	"encoding/binary"
-	"encoding/hex"
 	"fmt"
 	"math/big"
 	"net"
@@ -661,7 +651,9 @@ func (s *DNSServer) qnameMinimizeResolve(qname, qtype string) []string {
 			if i == 0 {
 				// Это целевой домен
 				targetResults := s.resolver.Resolve(qname, qtype)
-				results = append(results, targetResults...)
+				for _, tr := range targetResults {
+					results = append(results, tr.String())
+				}
 				break
 			}
 		}
@@ -690,13 +682,13 @@ func (s *DNSServer) fetchFromAuthoritative(qname string, qtype uint16) ([]dns.RR
 		if len(nsResults) > 0 {
 			// Найдены NS серверы для этой зоны
 			for _, nsRes := range nsResults {
-				if rr, err := dns.NewRR(nsRes); err == nil {
+				if rr, err := dns.NewRR(nsRes.String()); err == nil {
 					if _, ok := rr.(*dns.NS); ok {
 						// Получаем IP адреса NS серверов
 						nsName := rr.Header().Name
 						aResults := s.resolver.Resolve(nsName, "A")
 						for _, aRes := range aResults {
-							if aRR, err := dns.NewRR(aRes); err == nil {
+							if aRR, err := dns.NewRR(aRes.String()); err == nil {
 								if a, ok := aRR.(*dns.A); ok {
 									// Запрашиваем записи у NS сервера
 									c := &dns.Client{Timeout: 5 * time.Second}
@@ -748,7 +740,7 @@ func (s *DNSServer) fetchDNSSECRecordsAsync(qname string) ([]dns.RR, []*dns.DNSK
 		mu.Lock()
 		defer mu.Unlock()
 		for _, res := range results {
-			if rr, err := dns.NewRR(res); err == nil {
+			if rr, err := dns.NewRR(res.String()); err == nil {
 				rrs = append(rrs, rr)
 			}
 		}
@@ -762,7 +754,7 @@ func (s *DNSServer) fetchDNSSECRecordsAsync(qname string) ([]dns.RR, []*dns.DNSK
 		mu.Lock()
 		defer mu.Unlock()
 		for _, res := range results {
-			if rr, err := dns.NewRR(res); err == nil {
+			if rr, err := dns.NewRR(res.String()); err == nil {
 				if key, ok := rr.(*dns.DNSKEY); ok {
 					keys = append(keys, key)
 				}
@@ -778,7 +770,7 @@ func (s *DNSServer) fetchDNSSECRecordsAsync(qname string) ([]dns.RR, []*dns.DNSK
 		mu.Lock()
 		defer mu.Unlock()
 		for _, res := range results {
-			if rr, err := dns.NewRR(res); err == nil {
+			if rr, err := dns.NewRR(res.String()); err == nil {
 				if ds, ok := rr.(*dns.DS); ok {
 					dsRecords = append(dsRecords, ds)
 				}
