@@ -15,7 +15,7 @@ NC='\033[0m' # No Color
 
 # Константы
 DNS_VERSION="1.0"
-DNS_PORT="5454"
+DNS_PORT="5353"
 DNS_USER="astracat-dns"
 DNS_DIR="/opt/astracat-dns"
 DNS_LOG_DIR="/var/log/astracat-dns"
