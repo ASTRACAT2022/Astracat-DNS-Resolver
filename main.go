@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"encoding/base32"
 	"github.com/domainr/dnsr"
 	"github.com/miekg/dns"
 	
