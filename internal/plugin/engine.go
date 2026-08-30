@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"balancedns/internal/config"
+	"balancedns/internal/metrics"
 
 	"github.com/miekg/dns"
 	lua "github.com/yuin/gopher-lua"
@@ -43,6 +44,7 @@ type Decision struct {
 
 type Engine struct {
 	runners []runner
+	metrics *metrics.Provider
 }
 
 type runner interface {
@@ -51,6 +53,10 @@ type runner interface {
 }
 
 func NewEngine(entries []config.PluginEntry, defaultTimeout time.Duration) (*Engine, error) {
+	return NewEngineWithMetrics(entries, defaultTimeout, nil)
+}
+
+func NewEngineWithMetrics(entries []config.PluginEntry, defaultTimeout time.Duration, m *metrics.Provider) (*Engine, error) {
 	runners := make([]runner, 0, len(entries))
 
 	for i := range entries {
@@ -78,7 +84,7 @@ func NewEngine(entries []config.PluginEntry, defaultTimeout time.Duration) (*Eng
 		}
 	}
 
-	return &Engine{runners: runners}, nil
+	return &Engine{runners: runners, metrics: m}, nil
 }
 
 func (e *Engine) Decide(initial dns.Question) (Decision, error) {
@@ -86,8 +92,18 @@ func (e *Engine) Decide(initial dns.Question) (Decision, error) {
 	decision := Decision{Action: ActionForward, Question: current}
 
 	for _, r := range e.runners {
+		start := time.Now()
+		if e.metrics != nil {
+			e.metrics.IncPluginRequest(r.Name())
+		}
 		d, err := r.Run(current)
+		if e.metrics != nil {
+			e.metrics.ObservePluginDuration(r.Name(), time.Since(start))
+		}
 		if err != nil {
+			if e.metrics != nil {
+				e.metrics.IncPluginError(r.Name())
+			}
 			return Decision{}, fmt.Errorf("plugin %s: %w", r.Name(), err)
 		}
 

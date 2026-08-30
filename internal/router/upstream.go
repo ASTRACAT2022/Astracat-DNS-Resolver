@@ -34,6 +34,10 @@ type Upstream struct {
 	dnsClient *dns.Client
 	tcpClient *dns.Client
 	dohClient *http.Client
+
+	// metrics holds pre-resolved metric handles for this upstream, avoiding
+	// per-request WithLabelValues lookups on the hot path.
+	metrics *metrics.UpstreamMetrics
 }
 
 type Resolver struct {
@@ -63,6 +67,9 @@ func NewResolver(cfg []config.Upstream, m *metrics.Provider) (*Resolver, error) 
 			Zones:                 zones,
 			Timeout:               time.Duration(u.TimeoutMS) * time.Millisecond,
 			order:                 i,
+		}
+		if m != nil {
+			up.metrics = m.UpstreamMetricsFor(u.Name)
 		}
 
 		switch up.Protocol {
@@ -120,8 +127,11 @@ func (r *Resolver) Forward(ctx context.Context, request *dns.Msg, q dns.Question
 	for i := range candidates {
 		up := candidates[i]
 		resp, err := r.exchange(ctx, up, requestCopy)
-		if err == nil {
+		if err == nil && resp != nil {
 			return resp, up, nil
+		}
+		if err == nil {
+			err = errors.New("empty upstream response")
 		}
 		errs = append(errs, fmt.Sprintf("%s(%s): %v", up.Name, up.Protocol, err))
 	}
@@ -137,22 +147,50 @@ func (r *Resolver) exchange(parent context.Context, up Upstream, msg *dns.Msg) (
 	}
 	defer cancel()
 
+	m := up.metrics
+	if m != nil {
+		m.Requests.Inc()
+		m.InFlight.Inc()
+		defer m.InFlight.Dec()
+	}
+
+	var (
+		resp *dns.Msg
+		err  error
+	)
 	switch up.Protocol {
 	case "udp":
-		return r.exchangeDNS(ctx, up, msg, true)
+		resp, err = r.exchangeDNS(ctx, up, msg, true)
 	case "tcp", "dot":
-		return r.exchangeDNS(ctx, up, msg, false)
+		resp, err = r.exchangeDNS(ctx, up, msg, false)
 	case "doh":
-		return r.exchangeDoH(ctx, up, msg)
+		resp, err = r.exchangeDoH(ctx, up, msg)
 	default:
-		return nil, fmt.Errorf("unsupported upstream protocol %q", up.Protocol)
+		err = fmt.Errorf("unsupported upstream protocol %q", up.Protocol)
 	}
+
+	if err != nil {
+		if m != nil {
+			m.Errors.Inc()
+			m.Health.Set(0)
+			if errors.Is(err, context.DeadlineExceeded) || isTimeout(err) {
+				m.Timeouts.Inc()
+			}
+		}
+		return nil, err
+	}
+	if m != nil {
+		m.Health.Set(1)
+	}
+	return resp, nil
 }
 
 func (r *Resolver) exchangeDNS(ctx context.Context, up Upstream, msg *dns.Msg, tcpFallback bool) (*dns.Msg, error) {
 	start := time.Now()
 	resp, _, err := up.dnsClient.ExchangeContext(ctx, msg, up.Addr)
-	r.metrics.ObserveUpstreamLatency(up.Name, time.Since(start))
+	if up.metrics != nil {
+		up.metrics.Duration.Observe(time.Since(start).Seconds())
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -160,7 +198,9 @@ func (r *Resolver) exchangeDNS(ctx context.Context, up Upstream, msg *dns.Msg, t
 	if tcpFallback && resp != nil && resp.Truncated {
 		tcpStart := time.Now()
 		resp, _, err = up.tcpClient.ExchangeContext(ctx, msg, up.Addr)
-		r.metrics.ObserveUpstreamLatency(up.Name, time.Since(tcpStart))
+		if up.metrics != nil {
+			up.metrics.Duration.Observe(time.Since(tcpStart).Seconds())
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -183,7 +223,9 @@ func (r *Resolver) exchangeDoH(ctx context.Context, up Upstream, msg *dns.Msg) (
 
 	start := time.Now()
 	resp, err := up.dohClient.Do(req)
-	r.metrics.ObserveUpstreamLatency(up.Name, time.Since(start))
+	if up.metrics != nil {
+		up.metrics.Duration.Observe(time.Since(start).Seconds())
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -208,16 +250,16 @@ func (r *Resolver) exchangeDoH(ctx context.Context, up Upstream, msg *dns.Msg) (
 
 func (r *Resolver) selectCandidates(qname string) []Upstream {
 	fqdn := normalizeZone(qname)
-	type scored struct {
-		up    Upstream
-		score int
-	}
 
-	list := make([]scored, 0, len(r.upstreams))
+	// Compute a score for each upstream: longest matching zone length, or 0
+	// for a catch-all (no zones). Upstreams with no matching zone are skipped.
+	scores := make([]int, len(r.upstreams))
+	count := 0
 	for i := range r.upstreams {
 		up := r.upstreams[i]
 		if len(up.Zones) == 0 {
-			list = append(list, scored{up: up, score: 0})
+			scores[i] = 0
+			count++
 			continue
 		}
 		best := -1
@@ -229,20 +271,33 @@ func (r *Resolver) selectCandidates(qname string) []Upstream {
 			}
 		}
 		if best >= 0 {
-			list = append(list, scored{up: up, score: best})
+			scores[i] = best
+			count++
 		}
 	}
 
-	sort.SliceStable(list, func(i, j int) bool {
-		if list[i].score == list[j].score {
-			return list[i].up.order < list[j].up.order
+	if count == 0 {
+		return nil
+	}
+
+	// Sort matching upstream indices by (score desc, order asc).
+	idx := make([]int, 0, count)
+	for i := range r.upstreams {
+		if scores[i] >= 0 {
+			idx = append(idx, i)
 		}
-		return list[i].score > list[j].score
+	}
+	sort.SliceStable(idx, func(a, b int) bool {
+		ia, ib := idx[a], idx[b]
+		if scores[ia] == scores[ib] {
+			return r.upstreams[ia].order < r.upstreams[ib].order
+		}
+		return scores[ia] > scores[ib]
 	})
 
-	out := make([]Upstream, 0, len(list))
-	for _, item := range list {
-		out = append(out, item.up)
+	out := make([]Upstream, 0, count)
+	for _, i := range idx {
+		out = append(out, r.upstreams[i])
 	}
 	return out
 }
@@ -312,4 +367,13 @@ func minDuration(a, b time.Duration) time.Duration {
 		return a
 	}
 	return b
+}
+
+// isTimeout reports whether err is a network timeout (net.Error with Timeout).
+func isTimeout(err error) bool {
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return true
+	}
+	return false
 }

@@ -5,7 +5,10 @@ import (
 	"hash/fnv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"balancedns/internal/metrics"
 
 	"github.com/miekg/dns"
 )
@@ -32,12 +35,22 @@ type shard struct {
 }
 
 type Cache struct {
-	minTTL time.Duration
-	maxTTL time.Duration
-	shards []shard
+	minTTL  time.Duration
+	maxTTL  time.Duration
+	shards  []shard
+	metrics *metrics.Provider
+
+	// entries is a running count of cached items, updated atomically on
+	// insert/evict/expire. It is O(1) and avoids locking all shards from
+	// within a shard-critical section (which would deadlock).
+	entries atomic.Int64
 }
 
 func New(capacity int, minTTLSeconds, maxTTLSeconds uint32) *Cache {
+	return NewWithMetrics(capacity, minTTLSeconds, maxTTLSeconds, nil)
+}
+
+func NewWithMetrics(capacity int, minTTLSeconds, maxTTLSeconds uint32, m *metrics.Provider) *Cache {
 	if capacity <= 0 {
 		capacity = 1
 	}
@@ -53,9 +66,10 @@ func New(capacity int, minTTLSeconds, maxTTLSeconds uint32) *Cache {
 	}
 
 	return &Cache{
-		minTTL: time.Duration(minTTLSeconds) * time.Second,
-		maxTTL: time.Duration(maxTTLSeconds) * time.Second,
-		shards: shards,
+		minTTL:  time.Duration(minTTLSeconds) * time.Second,
+		maxTTL:  time.Duration(maxTTLSeconds) * time.Second,
+		shards:  shards,
+		metrics: m,
 	}
 }
 
@@ -68,17 +82,26 @@ func (c *Cache) Get(q dns.Question) (*dns.Msg, bool) {
 
 	item, ok := s.items[k]
 	if !ok {
+		c.incMiss()
 		return nil, false
 	}
 	if time.Now().After(item.expiresAt) {
 		s.remove(item)
+		c.entries.Add(-1)
+		c.incEviction()
+		c.incMiss()
 		return nil, false
 	}
 
 	s.ll.MoveToFront(item.element)
+	c.incHit()
 	return item.message.Copy(), true
 }
 
+// Set stores response in the cache. The caller must not mutate response after
+// Set returns: the cache retains a reference to it (no defensive copy) to avoid
+// a double deep-copy on the hot path. Get always returns a deep copy, so the
+// stored message is never exposed directly to readers.
 func (c *Cache) Set(q dns.Question, response *dns.Msg) {
 	if response == nil {
 		return
@@ -97,7 +120,7 @@ func (c *Cache) Set(q dns.Question, response *dns.Msg) {
 	defer s.mu.Unlock()
 
 	if current, ok := s.items[k]; ok {
-		current.message = response.Copy()
+		current.message = response
 		current.expiresAt = expiresAt
 		s.ll.MoveToFront(current.element)
 		return
@@ -106,13 +129,43 @@ func (c *Cache) Set(q dns.Question, response *dns.Msg) {
 	elem := s.ll.PushFront(k)
 	s.items[k] = &entry{
 		key:       k,
-		message:   response.Copy(),
+		message:   response,
 		expiresAt: expiresAt,
 		element:   elem,
 	}
 
 	if len(s.items) > s.cap {
 		s.evictOldest()
+		c.entries.Add(-1)
+		c.incEviction()
+	}
+	c.entries.Add(1)
+	c.reportEntries()
+}
+
+func (c *Cache) incHit() {
+	if c.metrics != nil {
+		c.metrics.IncCacheHits()
+	}
+}
+
+func (c *Cache) incMiss() {
+	if c.metrics != nil {
+		c.metrics.IncCacheMisses()
+	}
+}
+
+func (c *Cache) incEviction() {
+	if c.metrics != nil {
+		c.metrics.IncCacheEvictions()
+	}
+}
+
+// reportEntries publishes the running entry count. It is O(1) and safe to
+// call from within a shard-critical section.
+func (c *Cache) reportEntries() {
+	if c.metrics != nil {
+		c.metrics.SetCacheEntries(int(c.entries.Load()))
 	}
 }
 

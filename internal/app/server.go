@@ -57,12 +57,12 @@ func New(cfg *config.Config) (*Server, error) {
 
 	var c *cache.Cache
 	if cfg.Cache.Enabled {
-		c = cache.New(cfg.Cache.Capacity, cfg.Cache.MinTTLSeconds, cfg.Cache.MaxTTLSeconds)
+		c = cache.NewWithMetrics(cfg.Cache.Capacity, cfg.Cache.MinTTLSeconds, cfg.Cache.MaxTTLSeconds, m)
 	}
 
 	var engine *plugin.Engine
 	if cfg.Plugins.Enabled && len(cfg.Plugins.Entries) > 0 {
-		engine, err = plugin.NewEngine(cfg.Plugins.Entries, time.Duration(cfg.Plugins.TimeoutMS)*time.Millisecond)
+		engine, err = plugin.NewEngineWithMetrics(cfg.Plugins.Entries, time.Duration(cfg.Plugins.TimeoutMS)*time.Millisecond, m)
 		if err != nil {
 			return nil, err
 		}
@@ -310,7 +310,16 @@ func (s *Server) writeSupervisorStatus(w http.ResponseWriter, healthy bool) {
 }
 
 func (s *Server) handleDNS(w dns.ResponseWriter, req *dns.Msg) {
-	resp := s.resolveDNS(req, w.RemoteAddr())
+	defer func() {
+		if r := recover(); r != nil {
+			s.logger.Errorf("panic in dns handler: %v", r)
+			// Best-effort SERVFAIL so the client gets a response instead of a hang.
+			if req != nil {
+				_ = w.WriteMsg(s.rcodeResponse(req, dns.RcodeServerFailure))
+			}
+		}
+	}()
+	resp := s.resolveDNS(req, w.RemoteAddr(), protocolFromNet(w.LocalAddr()))
 	if err := w.WriteMsg(resp); err != nil {
 		s.logger.Errorf("write dns response: %v", err)
 	}
@@ -341,7 +350,7 @@ func (s *Server) handleDoH(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp := s.resolveDNS(req, &net.TCPAddr{IP: remoteIP})
+	resp := s.resolveDNS(req, &net.TCPAddr{IP: remoteIP}, "doh")
 	payload, err := resp.Pack()
 	if err != nil {
 		http.Error(w, "encode dns response", http.StatusInternalServerError)
@@ -380,29 +389,43 @@ func readDoHWireMessage(r *http.Request) ([]byte, error) {
 	}
 }
 
-func (s *Server) resolveDNS(req *dns.Msg, remoteAddr net.Addr) *dns.Msg {
-	s.metrics.IncQueries()
+func (s *Server) resolveDNS(req *dns.Msg, remoteAddr net.Addr, protocol string) *dns.Msg {
+	protocol = metrics.ProtocolLabel(protocol)
+
 	if len(req.Question) == 0 {
+		s.metrics.IncQueries(protocol, "OTHER")
+		s.metrics.IncResponse(metrics.RcodeLabel(dns.RcodeFormatError))
 		return s.rcodeResponse(req, dns.RcodeFormatError)
 	}
 
 	if !s.allowedRemoteIP(remoteIPFromNetAddr(remoteAddr)) {
+		s.metrics.IncQueries(protocol, metrics.QueryTypeLabel(req.Question[0].Qtype))
+		s.metrics.IncResponse(metrics.RcodeLabel(dns.RcodeRefused))
 		return s.rcodeResponse(req, dns.RcodeRefused)
 	}
 
 	current := normalizeQuestion(req.Question[0])
+	qtypeLabel := metrics.QueryTypeLabel(current.Qtype)
+
+	s.metrics.IncQueries(protocol, qtypeLabel)
+	s.metrics.IncQueriesInFlight()
+	defer s.metrics.DecQueriesInFlight()
+	start := time.Now()
+
 	remote := "<unknown>"
 	if remoteAddr != nil {
 		remote = remoteAddr.String()
 	}
 	s.logger.Queryf("query id=%d remote=%s domain=%s type=%s", req.Id, remote, current.Name, dns.TypeToString[current.Qtype])
 
+	var resp *dns.Msg
 	for _, stage := range s.chain {
 		switch stage {
 		case "blacklist":
 			if s.isBlocked(current.Name) {
 				s.logger.Debugf("blocked domain %s", current.Name)
-				return s.rcodeResponse(req, dns.RcodeRefused)
+				resp = s.rcodeResponse(req, dns.RcodeRefused)
+				goto done
 			}
 
 		case "hosts":
@@ -410,7 +433,8 @@ func (s *Server) resolveDNS(req *dns.Msg, remoteAddr net.Addr) *dns.Msg {
 				continue
 			}
 			if ans, ok := s.hosts.Lookup(current.Name, current.Qtype); ok {
-				return s.localDataResponse(req, current, plugin.LocalData{IPs: ans.IPs, TTL: ans.TTL})
+				resp = s.localDataResponse(req, current, plugin.LocalData{IPs: ans.IPs, TTL: ans.TTL})
+				goto done
 			}
 
 		case "cache":
@@ -421,8 +445,10 @@ func (s *Server) resolveDNS(req *dns.Msg, remoteAddr net.Addr) *dns.Msg {
 				s.metrics.IncCacheHits()
 				cached.Id = req.Id
 				cached.Question = []dns.Question{current}
-				return cached
+				resp = cached
+				goto done
 			}
+			s.metrics.IncCacheMisses()
 
 		case "lua_policy", "plugin", "plugins", "lua":
 			if s.plugins == nil {
@@ -430,36 +456,52 @@ func (s *Server) resolveDNS(req *dns.Msg, remoteAddr net.Addr) *dns.Msg {
 			}
 			decision, err := s.plugins.Decide(current)
 			if err != nil {
-				s.metrics.IncPluginErrors()
 				s.logger.Errorf("plugin execution error for %s: %v", current.Name, err)
 				continue
 			}
 			switch decision.Action {
 			case plugin.ActionBlock:
-				return s.rcodeResponse(req, dns.RcodeRefused)
+				resp = s.rcodeResponse(req, dns.RcodeRefused)
+				goto done
 			case plugin.ActionLocalData:
-				return s.localDataResponse(req, decision.Question, decision.Local)
+				resp = s.localDataResponse(req, decision.Question, decision.Local)
+				goto done
 			case plugin.ActionRewrite, plugin.ActionForward:
 				current = normalizeQuestion(decision.Question)
 			}
 
 		case "upstream":
-			resp, up, err := s.resolver.Forward(context.Background(), req, current)
-			if err != nil {
-				s.logger.Errorf("upstream forward failed for %s: %v", current.Name, err)
-				return s.rcodeResponse(req, dns.RcodeServerFailure)
+			var fwdErr error
+			resp, _, fwdErr = s.resolver.Forward(context.Background(), req, current)
+			if fwdErr != nil {
+				s.logger.Errorf("upstream forward failed for %s: %v", current.Name, fwdErr)
+				resp = s.rcodeResponse(req, dns.RcodeServerFailure)
+				goto done
+			}
+			if resp == nil {
+				s.logger.Errorf("upstream returned nil response for %s", current.Name)
+				resp = s.rcodeResponse(req, dns.RcodeServerFailure)
+				goto done
 			}
 			if s.cache != nil && resp.Rcode == dns.RcodeSuccess {
 				s.cache.Set(current, resp)
 			}
-			s.logger.Debugf("upstream=%s served domain=%s type=%s", up.Name, current.Name, dns.TypeToString[current.Qtype])
-			return resp
+			s.logger.Debugf("upstream served domain=%s type=%s", current.Name, dns.TypeToString[current.Qtype])
+			goto done
 		default:
 			s.logger.Debugf("unknown chain stage: %s", stage)
 		}
 	}
 
-	return s.rcodeResponse(req, dns.RcodeServerFailure)
+	resp = s.rcodeResponse(req, dns.RcodeServerFailure)
+
+done:
+	if resp == nil {
+		resp = s.rcodeResponse(req, dns.RcodeServerFailure)
+	}
+	s.metrics.ObserveQuery(protocol, qtypeLabel, metrics.RcodeLabel(resp.Rcode), time.Since(start))
+	s.metrics.IncResponse(metrics.RcodeLabel(resp.Rcode))
+	return resp
 }
 
 func (s *Server) localDataResponse(req *dns.Msg, q dns.Question, local plugin.LocalData) *dns.Msg {
@@ -607,6 +649,20 @@ func (s *Server) allowedRemoteIP(ip net.IP) bool {
 		}
 	}
 	return false
+}
+
+func protocolFromNet(addr net.Addr) string {
+	if addr == nil {
+		return "other"
+	}
+	switch addr.(type) {
+	case *net.UDPAddr:
+		return "udp"
+	case *net.TCPAddr:
+		return "tcp"
+	default:
+		return "other"
+	}
 }
 
 func remoteIPFromNetAddr(addr net.Addr) net.IP {
