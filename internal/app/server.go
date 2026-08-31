@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"balancedns/internal/cache"
@@ -43,6 +44,11 @@ type Server struct {
 
 	// Мульти-тенантность: конфиги по токенам (config_id) для DoH NextDNS-стиля.
 	tenants map[string]*tenantConfig
+
+	// Мульти-тенантность DoT: SNI (поддомен) → конфиг.
+	// Ключ — адрес клиента (RemoteAddr), заполняется в GetConfigForClient при TLS-handshake.
+	dotTenants   map[string]*tenantConfig
+	dotTenantsMu sync.Mutex
 
 	// Лог DNS-запросов (для аналитики по-доменно).
 	queryLog *QueryLogger
@@ -189,6 +195,7 @@ func New(cfg *config.Config) (*Server, error) {
 		acl:       acl,
 		chain:     normalizeChain(cfg.Routing.Chain),
 		blacklist: blacklist,
+		dotTenants: make(map[string]*tenantConfig),
 	}
 
 	// Лог DNS-запросов (для аналитики по-доменно).
@@ -417,6 +424,21 @@ func (s *Server) runDoTComponent(handler dns.Handler) func(context.Context) erro
 			TLSConfig: &tls.Config{
 				MinVersion:   tls.VersionTLS12,
 				Certificates: []tls.Certificate{cert},
+				// Персональный DoT: определяем конфиг по SNI (поддомену) при TLS-handshake.
+				// Например, ed2x.dns.astracat.network → конфиг ed2x.
+				GetConfigForClient: func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
+					if tenant := s.tenantForSNI(hello.ServerName); tenant != nil {
+						if conn, ok := hello.Conn.(*tls.Conn); ok {
+							s.dotTenantsMu.Lock()
+							s.dotTenants[conn.RemoteAddr().String()] = tenant
+							s.dotTenantsMu.Unlock()
+						}
+					}
+					return &tls.Config{
+						MinVersion:   tls.VersionTLS12,
+						Certificates: []tls.Certificate{cert},
+					}, nil
+				},
 			},
 		}
 
@@ -432,6 +454,31 @@ func (s *Server) runDoTComponent(handler dns.Handler) func(context.Context) erro
 		}
 		return fmt.Errorf("dot listener failed: %w", err)
 	}
+}
+
+// tenantForSNI определяет конфиг по SNI (ServerName) для персонального DoT.
+// Формат: {config_id}.dns.astracat.network → конфиг {config_id}.
+func (s *Server) tenantForSNI(serverName string) *tenantConfig {
+	if serverName == "" || s.tenants == nil {
+		return nil
+	}
+	// Убираем порт, если есть.
+	host := serverName
+	if h, _, err := net.SplitHostPort(serverName); err == nil {
+		host = h
+	}
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	// Ищем поддомен вида {config_id}.dns.astracat.network
+	// Берём самую левую часть (config_id).
+	parts := strings.Split(host, ".")
+	if len(parts) >= 4 {
+		// Например: ed2x.dns.astracat.network → parts[0]=ed2x
+		token := parts[0]
+		if t, ok := s.tenants[token]; ok {
+			return t
+		}
+	}
+	return nil
 }
 
 func (s *Server) runDoHComponent() func(context.Context) error {
@@ -545,7 +592,14 @@ func (s *Server) handleDNS(w dns.ResponseWriter, req *dns.Msg) {
 			}
 		}
 	}()
-	resp := s.resolveDNS(req, w.RemoteAddr(), protocolFromNet(w.LocalAddr()), nil)
+	// Для DoT (персональный): определяем конфиг по SNI (заполнен в GetConfigForClient).
+	var tenant *tenantConfig
+	if s.cfg.Listen.DoT != "" {
+		s.dotTenantsMu.Lock()
+		tenant = s.dotTenants[w.RemoteAddr().String()]
+		s.dotTenantsMu.Unlock()
+	}
+	resp := s.resolveDNS(req, w.RemoteAddr(), protocolFromNet(w.LocalAddr()), tenant)
 	if err := w.WriteMsg(resp); err != nil {
 		s.logger.Errorf("write dns response: %v", err)
 	}
