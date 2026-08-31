@@ -250,7 +250,9 @@ func (s *Server) runDoTComponent(handler dns.Handler) func(context.Context) erro
 func (s *Server) runDoHComponent() func(context.Context) error {
 	return func(ctx context.Context) error {
 		mux := http.NewServeMux()
-		mux.HandleFunc(s.cfg.Listen.DoHPath, s.handleDoH)
+		// Принимаем DoH на любом пути: и /dns-query, и /{token} (NextDNS-стиль).
+		// Токен в пути не влияет на обработку — все запросы идут по конфигу ноды.
+		mux.HandleFunc("/", s.handleDoH)
 
 		server := &http.Server{
 			Addr:         s.cfg.Listen.DoH,
