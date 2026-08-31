@@ -264,6 +264,13 @@ func (s *Server) loadTenants(dir string) error {
 		s.securityBlacklist = parseBlacklist(secDomains)
 	}
 
+	// Защитные лимиты: предотвращение перегрузки/OOM.
+	maxTenants := s.cfg.Limits.MaxTenants
+	maxPerTenant := s.cfg.Limits.MaxDomainsPerTenant
+	maxTotal := s.cfg.Limits.MaxTotalDomains
+	tenantCount := 0
+	totalDomains := 0
+
 	for _, e := range entries {
 		name := e.Name()
 		if !strings.HasSuffix(name, ".blacklist") {
@@ -271,6 +278,11 @@ func (s *Server) loadTenants(dir string) error {
 		}
 		// Общий security-файл — не тенант, пропускаем (загружается отдельно).
 		if name == "security.blacklist" {
+			continue
+		}
+		// Лимит на количество конфигов.
+		if maxTenants > 0 && tenantCount >= maxTenants {
+			s.logger.Infof("tenant limit reached (%d), skipping %s", maxTenants, name)
 			continue
 		}
 		token := strings.TrimSuffix(name, ".blacklist")
@@ -290,6 +302,17 @@ func (s *Server) loadTenants(dir string) error {
 			}
 			domains = append(domains, d)
 		}
+		// Лимит на размер blacklist одного конфига.
+		if maxPerTenant > 0 && len(domains) > maxPerTenant {
+			s.logger.Infof("tenant %s: %d domains exceeds limit %d, truncating", token, len(domains), maxPerTenant)
+			domains = domains[:maxPerTenant]
+		}
+		// Лимит на общее количество доменов (защита от OOM).
+		if maxTotal > 0 && totalDomains+len(domains) > maxTotal {
+			s.logger.Infof("total domain limit reached (%d), skipping %s", maxTotal, token)
+			continue
+		}
+		totalDomains += len(domains)
 		bl := parseBlacklist(domains)
 
 		// Загружаем hosts (если есть).
@@ -320,6 +343,7 @@ func (s *Server) loadTenants(dir string) error {
 		}
 
 		s.SetTenantFull(token, bl, al, hostTable, secEnabled)
+		tenantCount++
 		s.logger.Infof("tenant loaded: %s (%d domains, %d allowlist, security=%v)", token, len(domains), len(al.exact), secEnabled)
 	}
 	return nil

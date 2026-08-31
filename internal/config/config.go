@@ -26,6 +26,18 @@ type Config struct {
 	TenantsDir string `json:"tenants_dir" yaml:"tenants_dir"`
 	// QueryLog — путь к файлу лога DNS-запросов (JSON lines, для аналитики).
 	QueryLog string `json:"query_log" yaml:"query_log"`
+	// Limits — защитные лимиты (предотвращение перегрузки/OOM).
+	Limits LimitsConfig `json:"limits" yaml:"limits"`
+}
+
+// LimitsConfig — защитные лимиты для предотвращения перегрузки.
+type LimitsConfig struct {
+	// MaxTenants — максимум конфигов (тенантов). Защита от неограниченного роста.
+	MaxTenants int `json:"max_tenants" yaml:"max_tenants"`
+	// MaxDomainsPerTenant — максимум доменов в blacklist одного конфига.
+	MaxDomainsPerTenant int `json:"max_domains_per_tenant" yaml:"max_domains_per_tenant"`
+	// MaxTotalDomains — максимум доменов во всех конфигах (защита от OOM).
+	MaxTotalDomains int `json:"max_total_domains" yaml:"max_total_domains"`
 }
 
 type ListenConfig struct {
@@ -123,6 +135,19 @@ func Load(path string) (*Config, error) {
 }
 
 func applyDefaults(cfg *Config) {
+	// Защитные лимиты (по умолчанию):
+	// - максимум 200 конфигов
+	// - максимум 500K доменов в blacklist одного конфига
+	// - максимум 5M доменов во всех конфигах (защита от OOM)
+	if cfg.Limits.MaxTenants == 0 {
+		cfg.Limits.MaxTenants = 200
+	}
+	if cfg.Limits.MaxDomainsPerTenant == 0 {
+		cfg.Limits.MaxDomainsPerTenant = 500000
+	}
+	if cfg.Limits.MaxTotalDomains == 0 {
+		cfg.Limits.MaxTotalDomains = 5000000
+	}
 	if cfg.Listen.DNS == "" {
 		cfg.Listen.DNS = ":53"
 	}
