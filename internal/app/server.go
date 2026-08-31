@@ -53,10 +53,21 @@ type Server struct {
 	// Общий security-blacklist (фиды) и его домены для объединения с конфигами.
 	securityDomains map[string][]string
 
+	// Rate-limit: защита от DNS-амплификации/флуда.
+	// map[IP] → счётчик запросов в окне.
+	rlMu     sync.Mutex
+	rlCounts map[string]*rlEntry
+
 	// Лог DNS-запросов (для аналитики по-доменно).
 	queryLog *QueryLogger
 
 	supervisor *control.Supervisor
+}
+
+// rlEntry — счётчик запросов для rate-limit.
+type rlEntry struct {
+	count       int
+	windowStart time.Time
 }
 
 // tenantConfig — конфиг конкретного токена (config_id).
@@ -199,6 +210,7 @@ func New(cfg *config.Config) (*Server, error) {
 		chain:     normalizeChain(cfg.Routing.Chain),
 		blacklist: blacklist,
 		dotTenants: make(map[string]*tenantConfig),
+		rlCounts:  make(map[string]*rlEntry),
 	}
 
 	// Лог DNS-запросов (для аналитики по-доменно).
@@ -493,6 +505,26 @@ func (s *Server) runDoTComponent(handler dns.Handler) func(context.Context) erro
 	}
 }
 
+// rateLimited возвращает true, если IP превысил лимит запросов (защита от флуда).
+// Лимит: 1000 запросов в секунду с одного IP (окно 1 сек).
+func (s *Server) rateLimited(ip string) bool {
+	const limit = 1000
+	const window = time.Second
+	if ip == "" {
+		return false
+	}
+	s.rlMu.Lock()
+	defer s.rlMu.Unlock()
+	now := time.Now()
+	e, ok := s.rlCounts[ip]
+	if !ok || now.Sub(e.windowStart) >= window {
+		s.rlCounts[ip] = &rlEntry{count: 1, windowStart: now}
+		return false
+	}
+	e.count++
+	return e.count > limit
+}
+
 // tenantForSNI определяет конфиг по SNI (ServerName) для персонального DoT.
 // Формат: {config_id}.dns.astracat.network → конфиг {config_id}.
 func (s *Server) tenantForSNI(serverName string) *tenantConfig {
@@ -727,6 +759,13 @@ func (s *Server) resolveDNS(req *dns.Msg, remoteAddr net.Addr, protocol string, 
 	}
 
 	if !s.allowedRemoteIP(remoteIPFromNetAddr(remoteAddr)) {
+		s.metrics.IncQueries(protocol, metrics.QueryTypeLabel(req.Question[0].Qtype))
+		s.metrics.IncResponse(metrics.RcodeLabel(dns.RcodeRefused))
+		return s.rcodeResponse(req, dns.RcodeRefused)
+	}
+
+	// Rate-limit: защита от DNS-амплификации/флуда (макс. 1000 QPS с одного IP).
+	if s.rateLimited(remoteIPFromNetAddr(remoteAddr).String()) {
 		s.metrics.IncQueries(protocol, metrics.QueryTypeLabel(req.Question[0].Qtype))
 		s.metrics.IncResponse(metrics.RcodeLabel(dns.RcodeRefused))
 		return s.rcodeResponse(req, dns.RcodeRefused)
