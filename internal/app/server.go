@@ -50,8 +50,9 @@ type Server struct {
 	dotTenants   map[string]*tenantConfig
 	dotTenantsMu sync.Mutex
 
-	// Общий security-blacklist (фиды) и его домены для объединения с конфигами.
-	securityDomains map[string][]string
+	// Общий security-blacklist (фиды) — проверяется отдельно, НЕ дублируется в конфиги.
+	securityBlacklist blacklistIndex
+	securityDomains   map[string][]string
 
 	// Rate-limit: защита от DNS-амплификации/флуда.
 	// map[IP] → счётчик запросов в окне.
@@ -75,6 +76,9 @@ type tenantConfig struct {
 	blacklist blacklistIndex
 	allowlist allowlistIndex
 	hosts     *hosts.Table
+	// securityEnabled — true, если у конфига включены security-категории
+	// (тогда применяется общий security.blacklist).
+	securityEnabled bool
 }
 
 // tenantForPath возвращает конфиг по токену из пути (/{token}).
@@ -102,12 +106,12 @@ func (s *Server) SetTenant(token string, blacklist blacklistIndex, hosts *hosts.
 	s.tenants[token] = &tenantConfig{blacklist: blacklist, hosts: hosts}
 }
 
-// SetTenantFull добавляет/обновляет конфиг токена с allowlist.
-func (s *Server) SetTenantFull(token string, blacklist blacklistIndex, allowlist allowlistIndex, hosts *hosts.Table) {
+// SetTenantFull добавляет/обновляет конфиг токена с allowlist и security-флагом.
+func (s *Server) SetTenantFull(token string, blacklist blacklistIndex, allowlist allowlistIndex, hosts *hosts.Table, securityEnabled bool) {
 	if s.tenants == nil {
 		s.tenants = make(map[string]*tenantConfig)
 	}
-	s.tenants[token] = &tenantConfig{blacklist: blacklist, allowlist: allowlist, hosts: hosts}
+	s.tenants[token] = &tenantConfig{blacklist: blacklist, allowlist: allowlist, hosts: hosts, securityEnabled: securityEnabled}
 }
 
 // RemoveTenant удаляет конфиг токена.
@@ -246,8 +250,8 @@ func (s *Server) loadTenants(dir string) error {
 	}
 
 	// Загружаем общий security.blacklist (фиды) — один файл на ноду.
-	// Домены из него объединяются с конфигами, у которых включены security.
-	s.securityDomains = make(map[string][]string)
+	// Хранится отдельно (не дублируется в конфиги), проверяется в resolveDNS.
+	s.securityBlacklist = newBlacklistIndex()
 	if secData, err := os.ReadFile(filepath.Join(dir, "security.blacklist")); err == nil {
 		var secDomains []string
 		for _, line := range strings.Split(string(secData), "\n") {
@@ -257,7 +261,7 @@ func (s *Server) loadTenants(dir string) error {
 			}
 			secDomains = append(secDomains, d)
 		}
-		s.securityDomains["*"] = secDomains
+		s.securityBlacklist = parseBlacklist(secDomains)
 	}
 
 	for _, e := range entries {
@@ -288,18 +292,6 @@ func (s *Server) loadTenants(dir string) error {
 		}
 		bl := parseBlacklist(domains)
 
-		// Если у конфига включены security-категории (флаг {token}.security) —
-		// объединяем с общим security.blacklist.
-		if _, err := os.Stat(filepath.Join(dir, token+".security")); err == nil {
-			if secDomains, ok := s.securityDomains["*"]; ok {
-				for _, d := range secDomains {
-					// Нормализуем так же, как parseBlacklist (dns.Fqdn добавляет точку),
-					// чтобы isBlockedIndex находил совпадение.
-					bl.exact[normalizeDomain(d)] = struct{}{}
-				}
-			}
-		}
-
 		// Загружаем hosts (если есть).
 		var hostTable *hosts.Table
 		if _, err := os.Stat(hostsPath); err == nil {
@@ -321,8 +313,14 @@ func (s *Server) loadTenants(dir string) error {
 			}
 		}
 
-		s.SetTenantFull(token, bl, al, hostTable)
-		s.logger.Infof("tenant loaded: %s (%d domains, %d allowlist)", token, len(domains), len(al.exact))
+		// Флаг security: если у конфига включены security-категории — применяем общий security.blacklist.
+		secEnabled := false
+		if _, err := os.Stat(filepath.Join(dir, token+".security")); err == nil {
+			secEnabled = true
+		}
+
+		s.SetTenantFull(token, bl, al, hostTable, secEnabled)
+		s.logger.Infof("tenant loaded: %s (%d domains, %d allowlist, security=%v)", token, len(domains), len(al.exact), secEnabled)
 	}
 	return nil
 }
@@ -796,6 +794,13 @@ func (s *Server) resolveDNS(req *dns.Msg, remoteAddr net.Addr, protocol string, 
 			}
 			if isBlockedIndex(bl, current.Name) {
 				s.logger.Debugf("blocked domain %s", current.Name)
+				blocked = true
+				resp = s.rcodeResponse(req, dns.RcodeRefused)
+				goto done
+			}
+			// Общий security-blacklist (фиды): проверяем, если у конфига включены security.
+			if tenant != nil && tenant.securityEnabled && isBlockedIndex(s.securityBlacklist, current.Name) {
+				s.logger.Debugf("security blocked domain %s", current.Name)
 				blocked = true
 				resp = s.rcodeResponse(req, dns.RcodeRefused)
 				goto done
