@@ -427,17 +427,19 @@ func (s *Server) runDoTComponent(handler dns.Handler) func(context.Context) erro
 				// Персональный DoT: определяем конфиг по SNI (поддомену) при TLS-handshake.
 				// Например, ed2x.dns.astracat.network → конфиг ed2x.
 				GetConfigForClient: func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
+					// Персональный DoT: определяем конфиг по SNI. Если SNI не поддомен —
+					// возвращаем nil (используется дефолтный конфиг, обычный DoT не ломаем).
 					if tenant := s.tenantForSNI(hello.ServerName); tenant != nil {
-						if conn, ok := hello.Conn.(*tls.Conn); ok {
+						// Сохраняем tenant по адресу соединения (для handler).
+						// В miekg/dns hello.Conn — *net.TCPConn, поэтому используем его RemoteAddr.
+						if conn, ok := hello.Conn.(net.Conn); ok {
 							s.dotTenantsMu.Lock()
 							s.dotTenants[conn.RemoteAddr().String()] = tenant
 							s.dotTenantsMu.Unlock()
 						}
 					}
-					return &tls.Config{
-						MinVersion:   tls.VersionTLS12,
-						Certificates: []tls.Certificate{cert},
-					}, nil
+					// nil → используем дефолтный tls.Config (сертификат уже задан).
+					return nil, nil
 				},
 			},
 		}
