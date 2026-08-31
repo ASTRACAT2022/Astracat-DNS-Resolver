@@ -220,6 +220,26 @@ func (s *Server) loadTenants(dir string) error {
 	return nil
 }
 
+// ReloadTenantsLoop периодически перечитывает директорию тенантов
+// (чтобы blocklist обновлялся при изменении конфигов).
+func (s *Server) ReloadTenantsLoop(interval time.Duration, stop <-chan struct{}) {
+	if s.cfg.TenantsDir == "" {
+		return
+	}
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-t.C:
+			if err := s.loadTenants(s.cfg.TenantsDir); err != nil {
+				s.logger.Errorf("tenants reload failed: %v", err)
+			}
+		case <-stop:
+			return
+		}
+	}
+}
+
 // loadBlacklist загружает чёрный список: из файла (по одному домену на строку)
 // или из cfg.Blacklist.Domains. Файл эффективен для больших списков (100K+ доменов),
 // т.к. не требует парсинга огромного Lua-конфига.
@@ -246,6 +266,11 @@ func loadBlacklist(cfg *config.Config) (blacklistIndex, error) {
 func (s *Server) Run(ctx context.Context) error {
 	dnsMux := dns.NewServeMux()
 	dnsMux.HandleFunc(".", s.handleDNS)
+
+	// Периодическая перезагрузка тенантов (обновление blocklist при изменении конфигов).
+	if s.cfg.TenantsDir != "" {
+		go s.ReloadTenantsLoop(30*time.Second, ctx.Done())
+	}
 
 	components := []control.ComponentConfig{
 		{
