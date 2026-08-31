@@ -43,6 +43,9 @@ type Server struct {
 	// Мульти-тенантность: конфиги по токенам (config_id) для DoH NextDNS-стиля.
 	tenants map[string]*tenantConfig
 
+	// Лог DNS-запросов (для аналитики по-доменно).
+	queryLog *QueryLogger
+
 	supervisor *control.Supervisor
 }
 
@@ -148,6 +151,17 @@ func New(cfg *config.Config) (*Server, error) {
 		acl:       acl,
 		chain:     normalizeChain(cfg.Routing.Chain),
 		blacklist: blacklist,
+	}
+
+	// Лог DNS-запросов (для аналитики по-доменно).
+	if cfg.QueryLog != "" {
+		ql, err := NewQueryLogger(cfg.QueryLog)
+		if err != nil {
+			return nil, err
+		}
+		s.queryLog = ql
+		// Периодический flush буфера (не блокирует DNS).
+		go ql.FlushLoop(2*time.Second, nil)
 	}
 
 	// Загружаем тенантов (мульти-тенантность DoH) из директории.
@@ -529,6 +543,7 @@ func (s *Server) resolveDNS(req *dns.Msg, remoteAddr net.Addr, protocol string, 
 	// Выбираем blacklist/hosts: tenant (по токену) или дефолтные.
 	bl := s.blacklist
 	hosts := s.hosts
+	blocked := false
 	if tenant != nil {
 		bl = tenant.blacklist
 		hosts = tenant.hosts
@@ -566,6 +581,7 @@ func (s *Server) resolveDNS(req *dns.Msg, remoteAddr net.Addr, protocol string, 
 		case "blacklist":
 			if isBlockedIndex(bl, current.Name) {
 				s.logger.Debugf("blocked domain %s", current.Name)
+				blocked = true
 				resp = s.rcodeResponse(req, dns.RcodeRefused)
 				goto done
 			}
@@ -643,7 +659,30 @@ done:
 	}
 	s.metrics.ObserveQuery(protocol, qtypeLabel, metrics.RcodeLabel(resp.Rcode), time.Since(start))
 	s.metrics.IncResponse(metrics.RcodeLabel(resp.Rcode))
+	// Логируем запрос (асинхронно, не блокирует DNS-ответ) для аналитики по-доменно.
+	if s.queryLog != nil {
+		s.queryLog.Log(QueryLogEntry{
+			ConfigID: s.tenantToken(tenant),
+			Domain:   strings.TrimSuffix(current.Name, "."),
+			Blocked:  blocked,
+			Qtype:    dns.TypeToString[current.Qtype],
+			Ts:       time.Now().UnixMilli(),
+		})
+	}
 	return resp
+}
+
+// tenantToken возвращает config_id (токен) для tenant.
+func (s *Server) tenantToken(tenant *tenantConfig) string {
+	if tenant == nil {
+		return ""
+	}
+	for token, t := range s.tenants {
+		if t == tenant {
+			return token
+		}
+	}
+	return ""
 }
 
 func (s *Server) localDataResponse(req *dns.Msg, q dns.Question, local plugin.LocalData) *dns.Msg {

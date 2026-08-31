@@ -24,6 +24,8 @@ type Config struct {
 	// TenantsDir — директория с конфигами тенантов (мульти-тенантность DoH).
 	// Файлы: {token}.blacklist и {token}.hosts.
 	TenantsDir string `json:"tenants_dir" yaml:"tenants_dir"`
+	// QueryLog — путь к файлу лога DNS-запросов (JSON lines, для аналитики).
+	QueryLog string `json:"query_log" yaml:"query_log"`
 }
 
 type ListenConfig struct {
