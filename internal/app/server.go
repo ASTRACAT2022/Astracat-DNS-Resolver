@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -39,7 +40,48 @@ type Server struct {
 	chain     []string
 	blacklist blacklistIndex
 
+	// Мульти-тенантность: конфиги по токенам (config_id) для DoH NextDNS-стиля.
+	tenants map[string]*tenantConfig
+
 	supervisor *control.Supervisor
+}
+
+// tenantConfig — конфиг конкретного токена (config_id).
+type tenantConfig struct {
+	blacklist blacklistIndex
+	hosts     *hosts.Table
+}
+
+// tenantForPath возвращает конфиг по токену из пути (/{token}).
+// Если токен не найден — возвращает nil (используется дефолтный конфиг).
+func (s *Server) tenantForPath(path string) *tenantConfig {
+	if s.tenants == nil {
+		return nil
+	}
+	// Путь вида /{token} или /{token}/...
+	token := strings.TrimPrefix(path, "/")
+	if i := strings.Index(token, "/"); i >= 0 {
+		token = token[:i]
+	}
+	if token == "" || token == "dns-query" {
+		return nil
+	}
+	return s.tenants[token]
+}
+
+// SetTenant добавляет/обновляет конфиг токена.
+func (s *Server) SetTenant(token string, blacklist blacklistIndex, hosts *hosts.Table) {
+	if s.tenants == nil {
+		s.tenants = make(map[string]*tenantConfig)
+	}
+	s.tenants[token] = &tenantConfig{blacklist: blacklist, hosts: hosts}
+}
+
+// RemoveTenant удаляет конфиг токена.
+func (s *Server) RemoveTenant(token string) {
+	if s.tenants != nil {
+		delete(s.tenants, token)
+	}
 }
 
 // blacklistIndex — индекс чёрного списка для быстрого O(1) поиска.
@@ -108,7 +150,60 @@ func New(cfg *config.Config) (*Server, error) {
 		blacklist: blacklist,
 	}
 
+	// Загружаем тенантов (мульти-тенантность DoH) из директории.
+	if cfg.TenantsDir != "" {
+		if err := s.loadTenants(cfg.TenantsDir); err != nil {
+			return nil, err
+		}
+	}
+
 	return s, nil
+}
+
+// loadTenants загружает конфиги тенантов из директории.
+// Файлы: {token}.blacklist (домены по одному на строку) и {token}.hosts (hosts-формат).
+func (s *Server) loadTenants(dir string) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // директории нет — нет тенантов
+		}
+		return err
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasSuffix(name, ".blacklist") {
+			continue
+		}
+		token := strings.TrimSuffix(name, ".blacklist")
+		blPath := filepath.Join(dir, name)
+		hostsPath := filepath.Join(dir, token+".hosts")
+
+		// Загружаем blacklist.
+		data, err := os.ReadFile(blPath)
+		if err != nil {
+			continue
+		}
+		var domains []string
+		for _, line := range strings.Split(string(data), "\n") {
+			d := strings.TrimSpace(line)
+			if d == "" || strings.HasPrefix(d, "#") {
+				continue
+			}
+			domains = append(domains, d)
+		}
+		bl := parseBlacklist(domains)
+
+		// Загружаем hosts (если есть).
+		var hostTable *hosts.Table
+		if _, err := os.Stat(hostsPath); err == nil {
+			hostTable, _ = hosts.Load(hostsPath, 120)
+		}
+
+		s.SetTenant(token, bl, hostTable)
+		s.logger.Infof("tenant loaded: %s (%d domains)", token, len(domains))
+	}
+	return nil
 }
 
 // loadBlacklist загружает чёрный список: из файла (по одному домену на строку)
@@ -358,7 +453,7 @@ func (s *Server) handleDNS(w dns.ResponseWriter, req *dns.Msg) {
 			}
 		}
 	}()
-	resp := s.resolveDNS(req, w.RemoteAddr(), protocolFromNet(w.LocalAddr()))
+	resp := s.resolveDNS(req, w.RemoteAddr(), protocolFromNet(w.LocalAddr()), nil)
 	if err := w.WriteMsg(resp); err != nil {
 		s.logger.Errorf("write dns response: %v", err)
 	}
@@ -389,7 +484,7 @@ func (s *Server) handleDoH(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp := s.resolveDNS(req, &net.TCPAddr{IP: remoteIP}, "doh")
+	resp := s.resolveDNS(req, &net.TCPAddr{IP: remoteIP}, "doh", s.tenantForPath(r.URL.Path))
 	payload, err := resp.Pack()
 	if err != nil {
 		http.Error(w, "encode dns response", http.StatusInternalServerError)
@@ -428,8 +523,16 @@ func readDoHWireMessage(r *http.Request) ([]byte, error) {
 	}
 }
 
-func (s *Server) resolveDNS(req *dns.Msg, remoteAddr net.Addr, protocol string) *dns.Msg {
+func (s *Server) resolveDNS(req *dns.Msg, remoteAddr net.Addr, protocol string, tenant *tenantConfig) *dns.Msg {
 	protocol = metrics.ProtocolLabel(protocol)
+
+	// Выбираем blacklist/hosts: tenant (по токену) или дефолтные.
+	bl := s.blacklist
+	hosts := s.hosts
+	if tenant != nil {
+		bl = tenant.blacklist
+		hosts = tenant.hosts
+	}
 
 	if len(req.Question) == 0 {
 		s.metrics.IncQueries(protocol, "OTHER")
@@ -461,17 +564,17 @@ func (s *Server) resolveDNS(req *dns.Msg, remoteAddr net.Addr, protocol string) 
 	for _, stage := range s.chain {
 		switch stage {
 		case "blacklist":
-			if s.isBlocked(current.Name) {
+			if isBlockedIndex(bl, current.Name) {
 				s.logger.Debugf("blocked domain %s", current.Name)
 				resp = s.rcodeResponse(req, dns.RcodeRefused)
 				goto done
 			}
 
 		case "hosts":
-			if s.hosts == nil {
+			if hosts == nil {
 				continue
 			}
-			if ans, ok := s.hosts.Lookup(current.Name, current.Qtype); ok {
+			if ans, ok := hosts.Lookup(current.Name, current.Qtype); ok {
 				resp = s.localDataResponse(req, current, plugin.LocalData{IPs: ans.IPs, TTL: ans.TTL})
 				goto done
 			}
@@ -573,11 +676,16 @@ func (s *Server) localDataResponse(req *dns.Msg, q dns.Question, local plugin.Lo
 }
 
 func (s *Server) isBlocked(name string) bool {
+	return isBlockedIndex(s.blacklist, name)
+}
+
+// isBlockedIndex проверяет домен по конкретному индексу чёрного списка.
+func isBlockedIndex(bl blacklistIndex, name string) bool {
 	normalized := normalizeDomain(name)
-	if _, ok := s.blacklist.exact[normalized]; ok {
+	if _, ok := bl.exact[normalized]; ok {
 		return true
 	}
-	for _, suffix := range s.blacklist.suffixes {
+	for _, suffix := range bl.suffixes {
 		if strings.HasSuffix(normalized, suffix) {
 			return true
 		}

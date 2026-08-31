@@ -21,6 +21,9 @@ type Config struct {
 	Plugins   PluginConfig    `json:"plugins" yaml:"plugins"`
 	Blacklist BlacklistConfig `json:"blacklist" yaml:"blacklist"`
 	Control   ControlConfig   `json:"control" yaml:"control"`
+	// TenantsDir — директория с конфигами тенантов (мульти-тенантность DoH).
+	// Файлы: {token}.blacklist и {token}.hosts.
+	TenantsDir string `json:"tenants_dir" yaml:"tenants_dir"`
 }
 
 type ListenConfig struct {
