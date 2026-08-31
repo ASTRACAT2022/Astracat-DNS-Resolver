@@ -50,6 +50,9 @@ type Server struct {
 	dotTenants   map[string]*tenantConfig
 	dotTenantsMu sync.Mutex
 
+	// Общий security-blacklist (фиды) и его домены для объединения с конфигами.
+	securityDomains map[string][]string
+
 	// Лог DNS-запросов (для аналитики по-доменно).
 	queryLog *QueryLogger
 
@@ -229,9 +232,29 @@ func (s *Server) loadTenants(dir string) error {
 		}
 		return err
 	}
+
+	// Загружаем общий security.blacklist (фиды) — один файл на ноду.
+	// Домены из него объединяются с конфигами, у которых включены security.
+	s.securityDomains = make(map[string][]string)
+	if secData, err := os.ReadFile(filepath.Join(dir, "security.blacklist")); err == nil {
+		var secDomains []string
+		for _, line := range strings.Split(string(secData), "\n") {
+			d := strings.TrimSpace(line)
+			if d == "" || strings.HasPrefix(d, "#") {
+				continue
+			}
+			secDomains = append(secDomains, d)
+		}
+		s.securityDomains["*"] = secDomains
+	}
+
 	for _, e := range entries {
 		name := e.Name()
 		if !strings.HasSuffix(name, ".blacklist") {
+			continue
+		}
+		// Общий security-файл — не тенант, пропускаем (загружается отдельно).
+		if name == "security.blacklist" {
 			continue
 		}
 		token := strings.TrimSuffix(name, ".blacklist")
@@ -252,6 +275,18 @@ func (s *Server) loadTenants(dir string) error {
 			domains = append(domains, d)
 		}
 		bl := parseBlacklist(domains)
+
+		// Если у конфига включены security-категории (флаг {token}.security) —
+		// объединяем с общим security.blacklist.
+		if _, err := os.Stat(filepath.Join(dir, token+".security")); err == nil {
+			if secDomains, ok := s.securityDomains["*"]; ok {
+				for _, d := range secDomains {
+					// Нормализуем так же, как parseBlacklist (dns.Fqdn добавляет точку),
+					// чтобы isBlockedIndex находил совпадение.
+					bl.exact[normalizeDomain(d)] = struct{}{}
+				}
+			}
+		}
 
 		// Загружаем hosts (если есть).
 		var hostTable *hosts.Table
