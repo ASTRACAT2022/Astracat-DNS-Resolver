@@ -261,7 +261,9 @@ func (s *Server) loadTenants(dir string) error {
 				if d == "" || strings.HasPrefix(d, "#") {
 					continue
 				}
-				al.exact[d] = struct{}{}
+				// Нормализуем так же, как blacklist (dns.Fqdn добавляет точку в конце),
+				// чтобы isAllowed совпадал с current.Name.
+				al.exact[normalizeDomain(d)] = struct{}{}
 			}
 		}
 
