@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -36,14 +37,21 @@ type Server struct {
 	acl      []*net.IPNet
 
 	chain     []string
-	blacklist []blacklistRule
+	blacklist blacklistIndex
 
 	supervisor *control.Supervisor
 }
 
-type blacklistRule struct {
-	suffix bool
-	value  string
+// blacklistIndex — индекс чёрного списка для быстрого O(1) поиска.
+// Точные совпадения — в map; wildcard/suffix-правила — в отдельном слайсе
+// (их обычно немного). Это заменяет линейный скан всего списка на каждый запрос.
+type blacklistIndex struct {
+	exact    map[string]struct{}
+	suffixes []string
+}
+
+func newBlacklistIndex() blacklistIndex {
+	return blacklistIndex{exact: make(map[string]struct{})}
 }
 
 func New(cfg *config.Config) (*Server, error) {
@@ -81,6 +89,12 @@ func New(cfg *config.Config) (*Server, error) {
 		return nil, err
 	}
 
+	// Чёрный список: из файла (если задан) или из конфига.
+	blacklist, err := loadBlacklist(cfg)
+	if err != nil {
+		return nil, err
+	}
+
 	s := &Server{
 		cfg:       cfg,
 		logger:    logger,
@@ -91,10 +105,33 @@ func New(cfg *config.Config) (*Server, error) {
 		hosts:     hostTable,
 		acl:       acl,
 		chain:     normalizeChain(cfg.Routing.Chain),
-		blacklist: parseBlacklist(cfg.Blacklist.Domains),
+		blacklist: blacklist,
 	}
 
 	return s, nil
+}
+
+// loadBlacklist загружает чёрный список: из файла (по одному домену на строку)
+// или из cfg.Blacklist.Domains. Файл эффективен для больших списков (100K+ доменов),
+// т.к. не требует парсинга огромного Lua-конфига.
+func loadBlacklist(cfg *config.Config) (blacklistIndex, error) {
+	if cfg.Blacklist.File != "" {
+		data, err := os.ReadFile(cfg.Blacklist.File)
+		if err != nil {
+			return blacklistIndex{}, fmt.Errorf("read blacklist file: %w", err)
+		}
+		lines := strings.Split(string(data), "\n")
+		domains := make([]string, 0, len(lines))
+		for _, line := range lines {
+			d := strings.TrimSpace(line)
+			if d == "" || strings.HasPrefix(d, "#") {
+				continue
+			}
+			domains = append(domains, d)
+		}
+		return parseBlacklist(domains), nil
+	}
+	return parseBlacklist(cfg.Blacklist.Domains), nil
 }
 
 func (s *Server) Run(ctx context.Context) error {
@@ -535,14 +572,11 @@ func (s *Server) localDataResponse(req *dns.Msg, q dns.Question, local plugin.Lo
 
 func (s *Server) isBlocked(name string) bool {
 	normalized := normalizeDomain(name)
-	for _, rule := range s.blacklist {
-		if rule.suffix {
-			if strings.HasSuffix(normalized, rule.value) {
-				return true
-			}
-			continue
-		}
-		if normalized == rule.value {
+	if _, ok := s.blacklist.exact[normalized]; ok {
+		return true
+	}
+	for _, suffix := range s.blacklist.suffixes {
+		if strings.HasSuffix(normalized, suffix) {
 			return true
 		}
 	}
@@ -555,24 +589,24 @@ func (s *Server) rcodeResponse(req *dns.Msg, rcode int) *dns.Msg {
 	return msg
 }
 
-func parseBlacklist(domains []string) []blacklistRule {
-	rules := make([]blacklistRule, 0, len(domains))
+func parseBlacklist(domains []string) blacklistIndex {
+	idx := newBlacklistIndex()
 	for _, d := range domains {
 		d = strings.TrimSpace(strings.ToLower(d))
 		if d == "" {
 			continue
 		}
 		if strings.HasPrefix(d, "*.") {
-			rules = append(rules, blacklistRule{suffix: true, value: normalizeDomain(strings.TrimPrefix(d, "*"))})
+			idx.suffixes = append(idx.suffixes, normalizeDomain(strings.TrimPrefix(d, "*")))
 			continue
 		}
 		if strings.HasPrefix(d, ".") {
-			rules = append(rules, blacklistRule{suffix: true, value: normalizeDomain(d)})
+			idx.suffixes = append(idx.suffixes, normalizeDomain(d))
 			continue
 		}
-		rules = append(rules, blacklistRule{value: normalizeDomain(d)})
+		idx.exact[normalizeDomain(d)] = struct{}{}
 	}
-	return rules
+	return idx
 }
 
 func normalizeChain(chain []string) []string {

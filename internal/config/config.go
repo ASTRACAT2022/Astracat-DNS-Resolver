@@ -87,6 +87,10 @@ type PluginEntry struct {
 
 type BlacklistConfig struct {
 	Domains []string `json:"domains" yaml:"domains"`
+	// File — путь к файлу чёрного списка (по одному домену на строку).
+	// Если задан, загружается из файла (эффективно для больших списков),
+	// иначе — из Domains.
+	File string `json:"file" yaml:"file"`
 }
 
 type ControlConfig struct {
