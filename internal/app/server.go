@@ -39,6 +39,7 @@ type Server struct {
 
 	chain     []string
 	blacklist blacklistIndex
+	allowlist allowlistIndex
 
 	// Мульти-тенантность: конфиги по токенам (config_id) для DoH NextDNS-стиля.
 	tenants map[string]*tenantConfig
@@ -52,6 +53,7 @@ type Server struct {
 // tenantConfig — конфиг конкретного токена (config_id).
 type tenantConfig struct {
 	blacklist blacklistIndex
+	allowlist allowlistIndex
 	hosts     *hosts.Table
 }
 
@@ -80,6 +82,14 @@ func (s *Server) SetTenant(token string, blacklist blacklistIndex, hosts *hosts.
 	s.tenants[token] = &tenantConfig{blacklist: blacklist, hosts: hosts}
 }
 
+// SetTenantFull добавляет/обновляет конфиг токена с allowlist.
+func (s *Server) SetTenantFull(token string, blacklist blacklistIndex, allowlist allowlistIndex, hosts *hosts.Table) {
+	if s.tenants == nil {
+		s.tenants = make(map[string]*tenantConfig)
+	}
+	s.tenants[token] = &tenantConfig{blacklist: blacklist, allowlist: allowlist, hosts: hosts}
+}
+
 // RemoveTenant удаляет конфиг токена.
 func (s *Server) RemoveTenant(token string) {
 	if s.tenants != nil {
@@ -97,6 +107,34 @@ type blacklistIndex struct {
 
 func newBlacklistIndex() blacklistIndex {
 	return blacklistIndex{exact: make(map[string]struct{})}
+}
+
+// allowlistIndex — индекс белого списка (исключений) для O(1) поиска.
+// Домены из allowlist НЕ блокируются, даже если они в blacklist.
+type allowlistIndex struct {
+	exact map[string]struct{}
+}
+
+func newAllowlistIndex() allowlistIndex {
+	return allowlistIndex{exact: make(map[string]struct{})}
+}
+
+// isAllowed возвращает true, если домен (или его родитель) в allowlist.
+func (a allowlistIndex) isAllowed(name string) bool {
+	if len(a.exact) == 0 {
+		return false
+	}
+	// Проверяем сам домен и всех родителей (example.com, com).
+	for {
+		if _, ok := a.exact[name]; ok {
+			return true
+		}
+		idx := strings.IndexByte(name, '.')
+		if idx < 0 {
+			return false
+		}
+		name = name[idx+1:]
+	}
 }
 
 func New(cfg *config.Config) (*Server, error) {
@@ -214,8 +252,21 @@ func (s *Server) loadTenants(dir string) error {
 			hostTable, _ = hosts.Load(hostsPath, 120)
 		}
 
-		s.SetTenant(token, bl, hostTable)
-		s.logger.Infof("tenant loaded: %s (%d domains)", token, len(domains))
+		// Загружаем allowlist (исключения) — файл {token}.allowlist.
+		al := newAllowlistIndex()
+		alPath := filepath.Join(dir, token+".allowlist")
+		if alData, err := os.ReadFile(alPath); err == nil {
+			for _, line := range strings.Split(string(alData), "\n") {
+				d := strings.TrimSpace(line)
+				if d == "" || strings.HasPrefix(d, "#") {
+					continue
+				}
+				al.exact[d] = struct{}{}
+			}
+		}
+
+		s.SetTenantFull(token, bl, al, hostTable)
+		s.logger.Infof("tenant loaded: %s (%d domains, %d allowlist)", token, len(domains), len(al.exact))
 	}
 	return nil
 }
@@ -568,10 +619,12 @@ func (s *Server) resolveDNS(req *dns.Msg, remoteAddr net.Addr, protocol string, 
 	// Выбираем blacklist/hosts: tenant (по токену) или дефолтные.
 	bl := s.blacklist
 	hosts := s.hosts
+	al := s.allowlist
 	blocked := false
 	if tenant != nil {
 		bl = tenant.blacklist
 		hosts = tenant.hosts
+		al = tenant.allowlist
 	}
 
 	if len(req.Question) == 0 {
@@ -604,6 +657,11 @@ func (s *Server) resolveDNS(req *dns.Msg, remoteAddr net.Addr, protocol string, 
 	for _, stage := range s.chain {
 		switch stage {
 		case "blacklist":
+			// Исключения (allowlist) имеют приоритет: если домен в allowlist — не блокируем.
+			if al.isAllowed(current.Name) {
+				s.logger.Debugf("allowlisted domain %s (skip blacklist)", current.Name)
+				continue
+			}
 			if isBlockedIndex(bl, current.Name) {
 				s.logger.Debugf("blocked domain %s", current.Name)
 				blocked = true
